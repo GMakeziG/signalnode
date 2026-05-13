@@ -44,6 +44,11 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+#[derive(Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
+
 #[derive(Serialize)]
 pub struct AuthResponse {
     pub access_token: String,
@@ -54,6 +59,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
         .route("/login", post(login))
+        .route("/refresh", post(refresh))
 }
 
 async fn register(
@@ -158,6 +164,24 @@ async fn login(
     Json(AuthResponse { access_token, refresh_token }).into_response()
 }
 
+async fn refresh(
+    State(state): State<AppState>,
+    Json(body): Json<RefreshRequest>,
+) -> impl IntoResponse {
+    let claims = match token::decode_refresh_token(&body.refresh_token, &state.jwt_secret) {
+        Ok(c) => c,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    match encode_access_token(&claims.sub, &state.jwt_secret) {
+        Ok(access_token) => Json(serde_json::json!({ "access_token": access_token })).into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "access token encoding failed during refresh");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
@@ -245,5 +269,36 @@ mod tests {
     async fn register_rejects_short_password(pool: PgPool) {
         let res = post_json(pool, "/auth/register", json!({"email": "user@example.com", "password": "short"})).await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn refresh_valid_token_returns_access_token(pool: PgPool) {
+        let pool2 = pool.clone();
+        post_json(pool, "/auth/register", json!({"email": "refresh@example.com", "password": "password123"})).await;
+        let login_res = post_json(pool2.clone(), "/auth/login", json!({"email": "refresh@example.com", "password": "password123"})).await;
+        let body = axum::body::to_bytes(login_res.into_body(), usize::MAX).await.unwrap();
+        let tokens: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let refresh_token = tokens["refresh_token"].as_str().unwrap();
+
+        let res = post_json(pool2, "/auth/refresh", json!({"refresh_token": refresh_token})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["access_token"].is_string());
+    }
+
+    #[tokio::test]
+    async fn refresh_access_token_rejected() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let token = crate::auth::token::encode_access_token("550e8400-e29b-41d4-a716-446655440000", TEST_JWT_SECRET).unwrap();
+        let res = post_json(pool, "/auth/refresh", json!({"refresh_token": token})).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn refresh_invalid_token_rejected() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let res = post_json(pool, "/auth/refresh", json!({"refresh_token": "not.a.valid.token"})).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

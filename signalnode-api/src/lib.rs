@@ -9,8 +9,8 @@ pub struct AppState {
     pub jwt_secret: String,
 }
 
-pub fn app(pool: PgPool) -> Router {
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
+pub fn app(pool: PgPool, jwt_secret: String) -> Router {
+    assert!(!jwt_secret.is_empty(), "JWT_SECRET must be set and non-empty");
     let state = AppState { pool, jwt_secret };
     Router::new()
         .route("/health", get(health))
@@ -32,7 +32,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_200() {
         let pool = PgPool::connect_lazy("postgres://unused").unwrap();
-        let response = app(pool)
+        let response = app(pool, "test-secret-at-least-32-chars-long!".to_string())
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();

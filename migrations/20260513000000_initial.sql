@@ -1,0 +1,2 @@
+-- Initial migration placeholder.
+-- Schema tables will be added in subsequent slices.

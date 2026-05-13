@@ -1,0 +1,3 @@
+[workspace]
+members = ["signalnode-api", "signalnode-core"]
+resolver = "2"

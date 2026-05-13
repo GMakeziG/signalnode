@@ -25,6 +25,10 @@ target
 .claude/sessions/
 .claude/cache/
 .claude/tmp/
+.claude/worktrees/
+
+# Worktrees
+.worktrees/
 
 # Environment files
 .env

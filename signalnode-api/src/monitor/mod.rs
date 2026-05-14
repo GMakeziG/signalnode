@@ -32,8 +32,10 @@ struct CreateMonitorRequest {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/workspaces/{workspace_id}/monitors", post(create_monitor))
-        .route("/workspaces/{workspace_id}/monitors", get(list_monitors))
+        .route(
+            "/workspaces/{workspace_id}/monitors",
+            post(create_monitor).get(list_monitors),
+        )
 }
 
 async fn check_membership(
@@ -271,6 +273,7 @@ mod tests {
             json!({"name": "", "url": "https://example.com", "interval_secs": 60}),
             json!({"name": "Test", "url": "", "interval_secs": 60}),
             json!({"name": "Test", "url": "https://example.com", "interval_secs": 0}),
+            json!({"name": "Test", "url": "https://example.com", "interval_secs": -1}),
         ] {
             let res = authed(
                 pool.clone(),

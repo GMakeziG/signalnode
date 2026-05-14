@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -46,6 +46,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/workspaces/{workspace_id}/monitors",
             post(create_monitor).get(list_monitors),
+        )
+        .route(
+            "/workspaces/{workspace_id}/monitors/{monitor_id}",
+            get(get_monitor).patch(patch_monitor).delete(delete_monitor),
         )
 }
 
@@ -162,6 +166,51 @@ async fn list_monitors(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn get_monitor(
+    State(state): State<AppState>,
+    current_user: CurrentUser,
+    Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return status.into_response();
+    }
+
+    match sqlx::query_as::<_, Monitor>(
+        "SELECT id, workspace_id, name, url, interval_secs, status,
+                failure_threshold, recovery_threshold, kind, created_at, updated_at
+         FROM monitors WHERE id = $1 AND workspace_id = $2",
+    )
+    .bind(monitor_id)
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(monitor)) => Json(monitor).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to fetch monitor");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn patch_monitor(
+    State(_): State<AppState>,
+    _: CurrentUser,
+    Path(_): Path<(Uuid, Uuid)>,
+    Json(_): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    StatusCode::NOT_IMPLEMENTED
+}
+
+async fn delete_monitor(
+    State(_): State<AppState>,
+    _: CurrentUser,
+    Path(_): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    StatusCode::NOT_IMPLEMENTED
 }
 
 #[cfg(test)]
@@ -574,5 +623,67 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 1, "archived monitor must appear with include_archived=true");
         assert_eq!(json[0]["status"], "archived");
+    }
+
+    // --- get_monitor tests ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_monitor_success(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], mid.to_string());
+        assert_eq!(json["status"], "active");
+        assert_eq!(json["kind"], "uptime");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_monitor_not_found(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()), uid, None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_monitor_wrong_workspace(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid1 = create_test_workspace(&pool, uid).await;
+        let wid2 = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid1).await;
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid2}/monitors/{mid}"), uid, None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_monitor_not_member(pool: PgPool) {
+        let uid1 = create_test_user(&pool).await;
+        let uid2 = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid1).await;
+        let mid = create_test_monitor(&pool, wid).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid2, None).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_monitor_unauthenticated() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let res = app(pool, TEST_JWT_SECRET.to_string())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

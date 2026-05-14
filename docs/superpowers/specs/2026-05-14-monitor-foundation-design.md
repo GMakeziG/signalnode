@@ -11,17 +11,21 @@
 
 ```sql
 CREATE TABLE monitors (
-    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    workspace_id UUID        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    name         TEXT        NOT NULL,
-    url          TEXT        NOT NULL,
-    interval_secs INT        NOT NULL CHECK (interval_secs > 0),
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id  UUID        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name          TEXT        NOT NULL,
+    url           TEXT        NOT NULL,
+    interval_secs INT         NOT NULL CHECK (interval_secs > 0),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE INDEX monitors_workspace_id_idx ON monitors (workspace_id);
 ```
 
 - `workspace_id` FK with `ON DELETE CASCADE` — deleting a workspace removes its monitors.
 - `CHECK (interval_secs > 0)` — DB-level guard; application-level check mirrors this.
+- `updated_at` stored now; no trigger in this migration — future update handlers will set it explicitly.
 - No `owner_id` — ownership flows through workspace membership, not per-monitor.
 
 ---
@@ -47,13 +51,13 @@ Both routes require a valid Bearer access token (existing `auth_middleware`).
   - `interval_secs` must be > 0 (i.e., >= 1)
 - **Membership check:** `SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2`
   - Row missing: check if workspace exists → 404 if not, 403 if exists but not member
-- **Success:** `201 Created` + `{ id, workspace_id, name, url, interval_secs, created_at }`
+- **Success:** `201 Created` + `{ id, workspace_id, name, url, interval_secs, created_at, updated_at }`
 - **Errors:** 403 not member, 404 workspace not found, 422 invalid body, 500 DB
 
 ### `GET /api/workspaces/:workspace_id/monitors`
 
 - **Membership check:** same as above
-- **Query:** `SELECT id, workspace_id, name, url, interval_secs, created_at FROM monitors WHERE workspace_id = $1 ORDER BY created_at ASC`
+- **Query:** `SELECT id, workspace_id, name, url, interval_secs, created_at, updated_at FROM monitors WHERE workspace_id = $1 ORDER BY created_at ASC`
 - **Success:** `200 OK` + array (empty array if none)
 - **Errors:** 403 not member, 404 workspace not found, 500 DB
 

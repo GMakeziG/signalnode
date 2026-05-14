@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -34,6 +34,11 @@ struct CreateMonitorRequest {
     interval_secs: i32,
     failure_threshold: Option<i32>,
     recovery_threshold: Option<i32>,
+}
+
+#[derive(Deserialize, Default)]
+struct ListMonitorsQuery {
+    include_archived: Option<bool>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -130,21 +135,26 @@ async fn list_monitors(
     State(state): State<AppState>,
     current_user: CurrentUser,
     Path(workspace_id): Path<Uuid>,
+    Query(params): Query<ListMonitorsQuery>,
 ) -> impl IntoResponse {
     if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
         return status.into_response();
     }
 
-    match sqlx::query_as::<_, Monitor>(
+    let sql = if params.include_archived.unwrap_or(false) {
         "SELECT id, workspace_id, name, url, interval_secs, status,
                 failure_threshold, recovery_threshold, kind, created_at, updated_at
-         FROM monitors
-         WHERE workspace_id = $1
-         ORDER BY created_at ASC",
-    )
-    .bind(workspace_id)
-    .fetch_all(&state.pool)
-    .await
+         FROM monitors WHERE workspace_id = $1 ORDER BY created_at ASC"
+    } else {
+        "SELECT id, workspace_id, name, url, interval_secs, status,
+                failure_threshold, recovery_threshold, kind, created_at, updated_at
+         FROM monitors WHERE workspace_id = $1 AND status != 'archived' ORDER BY created_at ASC"
+    };
+
+    match sqlx::query_as::<_, Monitor>(sql)
+        .bind(workspace_id)
+        .fetch_all(&state.pool)
+        .await
     {
         Ok(monitors) => Json(monitors).into_response(),
         Err(e) => {
@@ -502,5 +512,67 @@ mod tests {
             .await;
             assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "body {body:?} should be 422");
         }
+    }
+
+    // --- archived filter helpers ---
+
+    async fn create_test_monitor(pool: &PgPool, workspace_id: Uuid) -> Uuid {
+        let monitor_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO monitors (id, workspace_id, name, url, interval_secs) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(monitor_id)
+        .bind(workspace_id)
+        .bind("Test Monitor")
+        .bind("https://example.com")
+        .bind(60_i32)
+        .execute(pool)
+        .await
+        .unwrap();
+        monitor_id
+    }
+
+    async fn archive_monitor(pool: &PgPool, monitor_id: Uuid) {
+        sqlx::query("UPDATE monitors SET status = 'archived' WHERE id = $1")
+            .bind(monitor_id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn list_monitors_excludes_archived_by_default(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+        archive_monitor(&pool, mid).await;
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors"), uid, None).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 0, "archived monitor must not appear in default list");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn list_monitors_include_archived_flag(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+        archive_monitor(&pool, mid).await;
+
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors?include_archived=true"),
+            uid,
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1, "archived monitor must appear with include_archived=true");
+        assert_eq!(json[0]["status"], "archived");
     }
 }

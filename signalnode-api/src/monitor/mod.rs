@@ -77,12 +77,34 @@ async fn create_monitor(
     State(state): State<AppState>,
     current_user: CurrentUser,
     Path(workspace_id): Path<Uuid>,
-    Json(_body): Json<CreateMonitorRequest>,
+    Json(body): Json<CreateMonitorRequest>,
 ) -> impl IntoResponse {
     if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
         return status.into_response();
     }
-    StatusCode::NOT_IMPLEMENTED.into_response()
+
+    if body.name.is_empty() || body.url.is_empty() || body.interval_secs < 1 {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+
+    match sqlx::query_as::<_, Monitor>(
+        "INSERT INTO monitors (workspace_id, name, url, interval_secs)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, workspace_id, name, url, interval_secs, created_at, updated_at",
+    )
+    .bind(workspace_id)
+    .bind(&body.name)
+    .bind(&body.url)
+    .bind(body.interval_secs)
+    .fetch_one(&state.pool)
+    .await
+    {
+        Ok(monitor) => (StatusCode::CREATED, Json(monitor)).into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to insert monitor");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn list_monitors(
@@ -197,6 +219,57 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- create_monitor tests ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_success(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({"name": "My Monitor", "url": "https://example.com", "interval_secs": 60})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "My Monitor");
+        assert_eq!(json["url"], "https://example.com");
+        assert_eq!(json["interval_secs"], 60);
+        assert_eq!(json["workspace_id"], wid.to_string());
+        assert!(json["id"].is_string());
+        assert!(json["created_at"].is_string());
+        assert!(json["updated_at"].is_string());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_invalid_body(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        for body in &[
+            json!({"name": "", "url": "https://example.com", "interval_secs": 60}),
+            json!({"name": "Test", "url": "", "interval_secs": 60}),
+            json!({"name": "Test", "url": "https://example.com", "interval_secs": 0}),
+        ] {
+            let res = authed(
+                pool.clone(),
+                Method::POST,
+                &format!("/api/workspaces/{wid}/monitors"),
+                uid,
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "body {body:?} should be 422"
+            );
+        }
     }
 
     // --- auth rejection tests ---

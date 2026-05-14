@@ -41,24 +41,59 @@ async fn check_membership(
     workspace_id: Uuid,
     user_id: Uuid,
 ) -> Result<(), StatusCode> {
-    todo!()
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            match sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
+            )
+            .bind(workspace_id)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(true) => Err(StatusCode::FORBIDDEN),
+                Ok(false) => Err(StatusCode::NOT_FOUND),
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to check workspace existence");
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check workspace membership");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 async fn create_monitor(
-    State(_state): State<AppState>,
-    _current_user: CurrentUser,
-    Path(_workspace_id): Path<Uuid>,
+    State(state): State<AppState>,
+    current_user: CurrentUser,
+    Path(workspace_id): Path<Uuid>,
     Json(_body): Json<CreateMonitorRequest>,
 ) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return status.into_response();
+    }
+    StatusCode::NOT_IMPLEMENTED.into_response()
 }
 
 async fn list_monitors(
-    State(_state): State<AppState>,
-    _current_user: CurrentUser,
-    Path(_workspace_id): Path<Uuid>,
+    State(state): State<AppState>,
+    current_user: CurrentUser,
+    Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return status.into_response();
+    }
+    StatusCode::NOT_IMPLEMENTED.into_response()
 }
 
 #[cfg(test)]
@@ -129,6 +164,39 @@ mod tests {
             None => builder.body(Body::empty()).unwrap(),
         };
         app(pool, TEST_JWT_SECRET.to_string()).oneshot(req).await.unwrap()
+    }
+
+    // --- membership guard tests ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_not_member(pool: PgPool) {
+        let uid1 = create_test_user(&pool).await;
+        let uid2 = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid1).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid2,
+            Some(json!({"name": "My Monitor", "url": "https://example.com", "interval_secs": 60})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_workspace_not_found(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = Uuid::new_v4();
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({"name": "My Monitor", "url": "https://example.com", "interval_secs": 60})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     // --- auth rejection tests ---

@@ -115,7 +115,23 @@ async fn list_monitors(
     if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
         return status.into_response();
     }
-    StatusCode::NOT_IMPLEMENTED.into_response()
+
+    match sqlx::query_as::<_, Monitor>(
+        "SELECT id, workspace_id, name, url, interval_secs, created_at, updated_at
+         FROM monitors
+         WHERE workspace_id = $1
+         ORDER BY created_at ASC",
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(monitors) => Json(monitors).into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to list monitors");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +325,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- list_monitors tests ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn list_monitors_returns_workspace_monitors(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({"name": "Monitor A", "url": "https://a.com", "interval_secs": 30})),
+        )
+        .await;
+        // second workspace owned by a different user — its monitor must not appear
+        let uid2 = create_test_user(&pool).await;
+        let wid2 = create_test_workspace(&pool, uid2).await;
+        authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid2}/monitors"),
+            uid2,
+            Some(json!({"name": "Monitor B", "url": "https://b.com", "interval_secs": 60})),
+        )
+        .await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "Monitor A");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn list_monitors_empty(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn list_monitors_not_member(pool: PgPool) {
+        let uid1 = create_test_user(&pool).await;
+        let uid2 = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid1).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid2,
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn list_monitors_workspace_not_found(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = Uuid::new_v4();
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }

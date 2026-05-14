@@ -51,7 +51,7 @@ Both routes require a valid Bearer access token (existing `auth_middleware`).
 - **Body:** `{ "name": "My Org", "slug": "my-org" }`
 - **Validation:**
   - `name` must be non-empty
-  - `slug` must match `^[a-z0-9][a-z0-9-]*$` (lowercase alphanumeric + hyphens, no leading hyphen)
+  - `slug` must match `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$` (lowercase alphanumeric + hyphens, no leading or trailing hyphen)
 - **Behaviour:** Single transaction — INSERT into `workspaces`, then INSERT into `workspace_members` with `role = 'owner'` and `user_id = current_user.id`
 - **Success:** `201 Created` + `{ "id", "name", "slug", "owner_id", "created_at" }`
 - **Errors:**
@@ -83,7 +83,7 @@ All DB-backed tests use `#[sqlx::test(migrations = "../migrations")]`. Auth-only
 | `create_workspace_success` | DB | 201, response JSON has correct fields |
 | `create_workspace_owner_membership` | DB | After create, `workspace_members` row exists with `user_id = creator`, `role = 'owner'` |
 | `create_workspace_duplicate_slug` | DB | 409 |
-| `create_workspace_invalid_slug` | DB | 422 (uppercase, spaces, leading hyphen) |
+| `create_workspace_invalid_slug` | DB | 422 (uppercase, spaces, leading hyphen, trailing hyphen) |
 | `create_workspace_empty_name` | DB | 422 |
 | `list_workspaces_returns_own` | DB | Only returns workspaces the authed user is a member of |
 | `list_workspaces_empty` | DB | 200 + `[]` |

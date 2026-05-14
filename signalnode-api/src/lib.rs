@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod middleware;
+pub mod monitor;
 pub mod workspace;
 
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
@@ -19,6 +20,7 @@ pub fn app(pool: PgPool, jwt_secret: String) -> Router {
     let protected = Router::new()
         .route("/api/me", get(me))
         .nest("/api", workspace::router())
+        .nest("/api", monitor::router())
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

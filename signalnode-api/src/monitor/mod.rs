@@ -100,6 +100,42 @@ async fn check_membership(
     }
 }
 
+async fn check_owner(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), StatusCode> {
+    match sqlx::query_scalar::<_, String>(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(role)) if role == "owner" => Ok(()),
+        Ok(Some(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(None) => match sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
+        )
+        .bind(workspace_id)
+        .fetch_one(pool)
+        .await
+        {
+            Ok(true) => Err(StatusCode::FORBIDDEN),
+            Ok(false) => Err(StatusCode::NOT_FOUND),
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to check workspace existence");
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        },
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check workspace owner");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn create_monitor(
     State(state): State<AppState>,
     current_user: CurrentUser,
@@ -295,11 +331,29 @@ async fn patch_monitor(
 }
 
 async fn delete_monitor(
-    State(_): State<AppState>,
-    _: CurrentUser,
-    Path(_): Path<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    current_user: CurrentUser,
+    Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    if let Err(status) = check_owner(&state.pool, workspace_id, current_user.id).await {
+        return status.into_response();
+    }
+
+    match sqlx::query(
+        "UPDATE monitors SET status = 'archived', updated_at = NOW() WHERE id = $1 AND workspace_id = $2",
+    )
+    .bind(monitor_id)
+    .bind(workspace_id)
+    .execute(&state.pool)
+    .await
+    {
+        Ok(result) if result.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to archive monitor");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -902,6 +956,98 @@ mod tests {
                     .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"name":"X"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- delete_monitor tests ---
+
+    async fn create_test_member(pool: &PgPool, workspace_id: Uuid) -> Uuid {
+        let user_id = create_test_user(pool).await;
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+        )
+        .bind(workspace_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        user_id
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn delete_monitor_owner_archives(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool.clone(), Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let list_res = authed(pool.clone(), Method::GET, &format!("/api/workspaces/{wid}/monitors"), uid, None).await;
+        let body = axum::body::to_bytes(list_res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap().as_array().unwrap().len(), 0);
+
+        let archived_res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors?include_archived=true"), uid, None).await;
+        let body2 = axum::body::to_bytes(archived_res.into_body(), usize::MAX).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(json2[0]["id"], mid.to_string());
+        assert_eq!(json2[0]["status"], "archived");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn delete_monitor_member_forbidden(pool: PgPool) {
+        let uid_owner = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid_owner).await;
+        let mid = create_test_monitor(&pool, wid).await;
+        let uid_member = create_test_member(&pool, wid).await;
+
+        let res = authed(pool, Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid_member, None).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn delete_monitor_idempotent(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res1 = authed(pool.clone(), Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        assert_eq!(res1.status(), StatusCode::NO_CONTENT);
+
+        let res2 = authed(pool, Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        assert_eq!(res2.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn delete_monitor_not_found(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+
+        let res = authed(pool, Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()), uid, None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn delete_monitor_workspace_not_found(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+
+        let res = authed(pool, Method::DELETE, &format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()), uid, None).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn delete_monitor_unauthenticated() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let res = app(pool, TEST_JWT_SECRET.to_string())
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await

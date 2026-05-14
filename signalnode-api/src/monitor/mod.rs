@@ -19,6 +19,10 @@ struct Monitor {
     name: String,
     url: String,
     interval_secs: i32,
+    status: String,
+    failure_threshold: i32,
+    recovery_threshold: i32,
+    kind: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -28,6 +32,8 @@ struct CreateMonitorRequest {
     name: String,
     url: String,
     interval_secs: i32,
+    failure_threshold: Option<i32>,
+    recovery_threshold: Option<i32>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -85,19 +91,30 @@ async fn create_monitor(
         return status.into_response();
     }
 
-    if body.name.is_empty() || body.url.is_empty() || body.interval_secs < 1 {
+    let failure_threshold = body.failure_threshold.unwrap_or(1);
+    let recovery_threshold = body.recovery_threshold.unwrap_or(1);
+
+    if body.name.is_empty()
+        || body.url.is_empty()
+        || body.interval_secs < 1
+        || failure_threshold < 1
+        || recovery_threshold < 1
+    {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
     match sqlx::query_as::<_, Monitor>(
-        "INSERT INTO monitors (workspace_id, name, url, interval_secs)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, workspace_id, name, url, interval_secs, created_at, updated_at",
+        "INSERT INTO monitors (workspace_id, name, url, interval_secs, failure_threshold, recovery_threshold)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, workspace_id, name, url, interval_secs, status,
+                   failure_threshold, recovery_threshold, kind, created_at, updated_at",
     )
     .bind(workspace_id)
     .bind(&body.name)
     .bind(&body.url)
     .bind(body.interval_secs)
+    .bind(failure_threshold)
+    .bind(recovery_threshold)
     .fetch_one(&state.pool)
     .await
     {
@@ -119,7 +136,8 @@ async fn list_monitors(
     }
 
     match sqlx::query_as::<_, Monitor>(
-        "SELECT id, workspace_id, name, url, interval_secs, created_at, updated_at
+        "SELECT id, workspace_id, name, url, interval_secs, status,
+                failure_threshold, recovery_threshold, kind, created_at, updated_at
          FROM monitors
          WHERE workspace_id = $1
          ORDER BY created_at ASC",
@@ -418,5 +436,71 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_includes_new_fields(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({"name": "M", "url": "https://example.com", "interval_secs": 60})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "active");
+        assert_eq!(json["kind"], "uptime");
+        assert_eq!(json["failure_threshold"], 1);
+        assert_eq!(json["recovery_threshold"], 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_explicit_thresholds(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({
+                "name": "M",
+                "url": "https://example.com",
+                "interval_secs": 60,
+                "failure_threshold": 3,
+                "recovery_threshold": 2
+            })),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["failure_threshold"], 3);
+        assert_eq!(json["recovery_threshold"], 2);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_invalid_threshold(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        for body in &[
+            json!({"name": "M", "url": "https://example.com", "interval_secs": 60, "failure_threshold": 0}),
+            json!({"name": "M", "url": "https://example.com", "interval_secs": 60, "recovery_threshold": 0}),
+        ] {
+            let res = authed(
+                pool.clone(),
+                Method::POST,
+                &format!("/api/workspaces/{wid}/monitors"),
+                uid,
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "body {body:?} should be 422");
+        }
     }
 }

@@ -41,6 +41,16 @@ struct ListMonitorsQuery {
     include_archived: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct PatchMonitorRequest {
+    name: Option<String>,
+    url: Option<String>,
+    interval_secs: Option<i32>,
+    status: Option<String>,
+    failure_threshold: Option<i32>,
+    recovery_threshold: Option<i32>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -197,12 +207,91 @@ async fn get_monitor(
 }
 
 async fn patch_monitor(
-    State(_): State<AppState>,
-    _: CurrentUser,
-    Path(_): Path<(Uuid, Uuid)>,
-    Json(_): Json<serde_json::Value>,
+    State(state): State<AppState>,
+    current_user: CurrentUser,
+    Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<PatchMonitorRequest>,
 ) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return status.into_response();
+    }
+
+    if body.name.is_none()
+        && body.url.is_none()
+        && body.interval_secs.is_none()
+        && body.status.is_none()
+        && body.failure_threshold.is_none()
+        && body.recovery_threshold.is_none()
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+
+    if matches!(&body.name, Some(n) if n.is_empty())
+        || matches!(&body.url, Some(u) if u.is_empty())
+        || matches!(body.interval_secs, Some(i) if i < 1)
+        || matches!(body.failure_threshold, Some(f) if f < 1)
+        || matches!(body.recovery_threshold, Some(r) if r < 1)
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+
+    if let Some(ref s) = body.status {
+        if s != "active" && s != "paused" {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+    }
+
+    let current_status = match sqlx::query_scalar::<_, String>(
+        "SELECT status FROM monitors WHERE id = $1 AND workspace_id = $2",
+    )
+    .bind(monitor_id)
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to fetch monitor status for patch");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if current_status == "archived" {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+
+    match sqlx::query_as::<_, Monitor>(
+        "UPDATE monitors
+         SET name               = COALESCE($1, name),
+             url                = COALESCE($2, url),
+             interval_secs      = COALESCE($3, interval_secs),
+             status             = COALESCE($4, status),
+             failure_threshold  = COALESCE($5, failure_threshold),
+             recovery_threshold = COALESCE($6, recovery_threshold),
+             updated_at         = NOW()
+         WHERE id = $7 AND workspace_id = $8
+         RETURNING id, workspace_id, name, url, interval_secs, status,
+                   failure_threshold, recovery_threshold, kind, created_at, updated_at",
+    )
+    .bind(body.name)
+    .bind(body.url)
+    .bind(body.interval_secs)
+    .bind(body.status)
+    .bind(body.failure_threshold)
+    .bind(body.recovery_threshold)
+    .bind(monitor_id)
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(monitor)) => Json(monitor).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to update monitor");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn delete_monitor(
@@ -680,6 +769,139 @@ mod tests {
                     .method(Method::GET)
                     .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- patch_monitor tests ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_name(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({"name": "Renamed"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "Renamed");
+        assert_eq!(json["url"], "https://example.com");
+        assert_eq!(json["status"], "active");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_pause_and_resume(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool.clone(), Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"status": "paused"}))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"], "paused");
+
+        let res2 = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"status": "active"}))).await;
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2 = axum::body::to_bytes(res2.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body2).unwrap()["status"], "active");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_thresholds(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"failure_threshold": 3, "recovery_threshold": 2}))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["failure_threshold"], 3);
+        assert_eq!(json["recovery_threshold"], 2);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_archived_status_rejected(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"status": "archived"}))).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_on_archived_rejected(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+        archive_monitor(&pool, mid).await;
+
+        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"name": "X"}))).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_empty_body_rejected(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({}))).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_invalid_interval(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"interval_secs": 0}))).await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_not_found(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+
+        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()), uid, Some(json!({"name": "X"}))).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn patch_monitor_not_member(pool: PgPool) {
+        let uid1 = create_test_user(&pool).await;
+        let uid2 = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid1).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid2, Some(json!({"name": "X"}))).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn patch_monitor_unauthenticated() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let res = app(pool, TEST_JWT_SECRET.to_string())
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"X"}"#))
                     .unwrap(),
             )
             .await

@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Router,
+    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -26,10 +26,300 @@ pub fn router() -> Router<AppState> {
     )
 }
 
+async fn check_membership(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), StatusCode> {
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            match sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
+            )
+            .bind(workspace_id)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(true) => Err(StatusCode::FORBIDDEN),
+                Ok(false) => Err(StatusCode::NOT_FOUND),
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to check workspace existence");
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check workspace membership");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
 async fn list_open_incidents(
-    _state: State<AppState>,
-    _current_user: CurrentUser,
-    _path: Path<Uuid>,
+    State(state): State<AppState>,
+    current_user: CurrentUser,
+    Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    StatusCode::NOT_IMPLEMENTED
+    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return status.into_response();
+    }
+
+    match sqlx::query_as::<_, Incident>(
+        "SELECT i.id, i.monitor_id, i.opened_at
+         FROM incidents i
+         JOIN monitors m ON m.id = i.monitor_id
+         WHERE m.workspace_id = $1
+           AND i.closed_at IS NULL
+         ORDER BY i.opened_at DESC",
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(incidents) => Json(incidents).into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to list open incidents");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::{app, auth::token::encode_access_token};
+
+    const TEST_JWT_SECRET: &str = "test-secret-at-least-32-chars-long!";
+
+    async fn create_test_user(pool: &PgPool) -> Uuid {
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
+            .bind(user_id)
+            .bind(format!("user-{}@test.com", user_id))
+            .bind("not-a-real-hash")
+            .execute(pool)
+            .await
+            .unwrap();
+        user_id
+    }
+
+    async fn create_test_workspace(pool: &PgPool, user_id: Uuid) -> Uuid {
+        let workspace_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace_id)
+        .bind("Test Workspace")
+        .bind(format!("ws-{}", workspace_id))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+        )
+        .bind(workspace_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        workspace_id
+    }
+
+    async fn create_test_monitor(pool: &PgPool, workspace_id: Uuid) -> Uuid {
+        let monitor_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO monitors (id, workspace_id, name, url, interval_secs) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(monitor_id)
+        .bind(workspace_id)
+        .bind("Test Monitor")
+        .bind("https://example.com")
+        .bind(60_i32)
+        .execute(pool)
+        .await
+        .unwrap();
+        monitor_id
+    }
+
+    async fn create_open_incident(pool: &PgPool, monitor_id: Uuid) -> Uuid {
+        let incident_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO incidents (id, monitor_id) VALUES ($1, $2)",
+        )
+        .bind(incident_id)
+        .bind(monitor_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        incident_id
+    }
+
+    async fn authed(
+        pool: PgPool,
+        method: Method,
+        uri: &str,
+        user_id: Uuid,
+    ) -> axum::response::Response {
+        let token = encode_access_token(&user_id.to_string(), TEST_JWT_SECRET).unwrap();
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        app(pool, TEST_JWT_SECRET.to_string())
+            .oneshot(req)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_open_incidents_empty(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_open_incidents_returns_open_only(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+
+        let open_id = create_open_incident(&pool, mid).await;
+
+        // One closed incident
+        sqlx::query(
+            "INSERT INTO incidents (monitor_id, opened_at, closed_at) \
+             VALUES ($1, NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '5 minutes')",
+        )
+        .bind(mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], open_id.to_string());
+        assert!(arr[0]["opened_at"].is_string());
+        assert!(arr[0]["monitor_id"].is_string());
+        assert!(arr[0].get("closed_at").is_none());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_open_incidents_scoped_to_workspace(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid1 = create_test_workspace(&pool, uid).await;
+        let wid2 = create_test_workspace(&pool, uid).await;
+        let mid1 = create_test_monitor(&pool, wid1).await;
+        let mid2 = create_test_monitor(&pool, wid2).await;
+
+        create_open_incident(&pool, mid1).await;
+        create_open_incident(&pool, mid2).await;
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid1}/incidents"), uid).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["monitor_id"], mid1.to_string());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_open_incidents_ordered_newest_first(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid1 = create_test_monitor(&pool, wid).await;
+        let mid2 = create_test_monitor(&pool, wid).await;
+
+        let older_id = Uuid::new_v4();
+        let newer_id = Uuid::new_v4();
+
+        sqlx::query(
+            "INSERT INTO incidents (id, monitor_id, opened_at) VALUES ($1, $2, NOW() - INTERVAL '10 minutes')",
+        )
+        .bind(older_id)
+        .bind(mid1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO incidents (id, monitor_id, opened_at) VALUES ($1, $2, NOW())",
+        )
+        .bind(newer_id)
+        .bind(mid2)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], newer_id.to_string());
+        assert_eq!(arr[1]["id"], older_id.to_string());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_open_incidents_not_member(pool: PgPool) {
+        let uid1 = create_test_user(&pool).await;
+        let uid2 = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid1).await;
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid2).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn get_open_incidents_wrong_workspace(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let _wid = create_test_workspace(&pool, uid).await;
+
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{}/incidents", Uuid::new_v4()), uid).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_open_incidents_unauthenticated() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let res = app(pool, TEST_JWT_SECRET.to_string())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&format!("/api/workspaces/{}/incidents", Uuid::new_v4()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
 }

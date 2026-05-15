@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod check_result;
 pub mod middleware;
 pub mod monitor;
 pub mod workspace;
@@ -21,6 +22,7 @@ pub fn app(pool: PgPool, jwt_secret: String) -> Router {
         .route("/api/me", get(me))
         .nest("/api", workspace::router())
         .nest("/api", monitor::router())
+        .nest("/api", check_result::router())
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

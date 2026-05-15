@@ -112,7 +112,15 @@ async fn create_check_result(
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
-    match sqlx::query_as::<_, CheckResult>(
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to begin transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let cr = match sqlx::query_as::<_, CheckResult>(
         "INSERT INTO check_results (monitor_id, status, latency_ms, error_detail)
          VALUES ($1, $2, $3, $4)
          RETURNING id, monitor_id, status, latency_ms, error_detail, checked_at",
@@ -121,12 +129,83 @@ async fn create_check_result(
     .bind(&body.status)
     .bind(body.latency_ms)
     .bind(body.error_detail.as_deref())
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     {
-        Ok(cr) => (StatusCode::CREATED, Json(cr)).into_response(),
+        Ok(cr) => cr,
         Err(e) => {
             tracing::error!(error = ?e, "failed to insert check_result");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let (monitor_status, failure_threshold, recovery_threshold) =
+        match sqlx::query_as::<_, (String, i32, i32)>(
+            "SELECT status, failure_threshold, recovery_threshold FROM monitors WHERE id = $1",
+        )
+        .bind(monitor_id)
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to fetch monitor for incident evaluation");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+    if monitor_status == "active" {
+        let open_incident: Option<Uuid> = match sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL LIMIT 1",
+        )
+        .bind(monitor_id)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to check for open incident");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+        if open_incident.is_none() {
+            let recent: Vec<String> = match sqlx::query_scalar::<_, String>(
+                "SELECT status FROM check_results \
+                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
+            )
+            .bind(monitor_id)
+            .bind(failure_threshold)
+            .fetch_all(&mut *tx)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to fetch results for open evaluation");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+            if recent.len() == failure_threshold as usize && recent.iter().all(|s| s == "down") {
+                if let Err(e) = sqlx::query("INSERT INTO incidents (monitor_id) VALUES ($1)")
+                    .bind(monitor_id)
+                    .execute(&mut *tx)
+                    .await
+                {
+                    tracing::error!(error = ?e, "failed to open incident");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        // Close path added in Task 5
+    }
+
+    let _ = recovery_threshold; // used in Task 5
+
+    match tx.commit().await {
+        Ok(_) => (StatusCode::CREATED, Json(cr)).into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to commit transaction");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -206,6 +285,30 @@ mod tests {
         .await
         .unwrap();
         workspace_id
+    }
+
+    async fn create_test_monitor_thresholds(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        failure_threshold: i32,
+        recovery_threshold: i32,
+    ) -> Uuid {
+        let monitor_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO monitors (id, workspace_id, name, url, interval_secs, failure_threshold, recovery_threshold) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(monitor_id)
+        .bind(workspace_id)
+        .bind("Test Monitor")
+        .bind("https://example.com")
+        .bind(60_i32)
+        .bind(failure_threshold)
+        .bind(recovery_threshold)
+        .execute(pool)
+        .await
+        .unwrap();
+        monitor_id
     }
 
     async fn create_test_monitor(pool: &PgPool, workspace_id: Uuid) -> Uuid {
@@ -534,6 +637,154 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn open_incident_count(pool: &PgPool, monitor_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL",
+        )
+        .bind(monitor_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    // --- incident open tests ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn open_incident_after_threshold(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        // failure_threshold = 2: need 2 consecutive down
+        let mid = create_test_monitor_thresholds(&pool, wid, 2, 1).await;
+
+        // First down — pre-inserted directly, threshold not yet crossed
+        sqlx::query(
+            "INSERT INTO check_results (monitor_id, status, checked_at) \
+             VALUES ($1, 'down', NOW() - INTERVAL '10 seconds')",
+        )
+        .bind(mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(open_incident_count(&pool, mid).await, 0);
+
+        // Second down via API — threshold crossed, incident opens
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(open_incident_count(&pool, mid).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn no_open_below_threshold(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        // failure_threshold = 2, only 1 down → should not open
+        let mid = create_test_monitor_thresholds(&pool, wid, 2, 1).await;
+
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(open_incident_count(&pool, mid).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn degraded_does_not_count(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        // failure_threshold = 2
+        let mid = create_test_monitor_thresholds(&pool, wid, 2, 1).await;
+
+        // Pre-insert a degraded result — breaks any pure-down streak
+        sqlx::query(
+            "INSERT INTO check_results (monitor_id, status, checked_at) \
+             VALUES ($1, 'degraded', NOW() - INTERVAL '10 seconds')",
+        )
+        .bind(mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // One down after degraded → last 2 are [down, degraded] — not all down
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(open_incident_count(&pool, mid).await, 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn no_duplicate_open_incident(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        // failure_threshold = 1: first down opens an incident
+        let mid = create_test_monitor_thresholds(&pool, wid, 1, 2).await;
+
+        // First down — opens incident
+        authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(open_incident_count(&pool, mid).await, 1);
+
+        // Second down — incident already open, should NOT open a second one
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(open_incident_count(&pool, mid).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn paused_monitor_no_open(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor_thresholds(&pool, wid, 1, 1).await;
+
+        // Pause the monitor directly
+        sqlx::query("UPDATE monitors SET status = 'paused' WHERE id = $1")
+            .bind(mid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(open_incident_count(&pool, mid).await, 0);
     }
 
     #[tokio::test]

@@ -41,7 +41,8 @@ fn is_valid_slug(slug: &str) -> bool {
     if !is_alnum(bytes[0]) || !is_alnum(bytes[bytes.len() - 1]) {
         return false;
     }
-    slug.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    slug.bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 async fn create_workspace(
@@ -63,15 +64,13 @@ async fn create_workspace(
 
     let workspace_id = Uuid::new_v4();
 
-    match sqlx::query(
-        "INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(workspace_id)
-    .bind(&body.name)
-    .bind(&body.slug)
-    .bind(current_user.id)
-    .execute(&mut *tx)
-    .await
+    match sqlx::query("INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)")
+        .bind(workspace_id)
+        .bind(&body.name)
+        .bind(&body.slug)
+        .bind(current_user.id)
+        .execute(&mut *tx)
+        .await
     {
         Ok(_) => {}
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
@@ -166,7 +165,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["name"], "My Org");
         assert_eq!(json["slug"], "my-org");
@@ -186,13 +187,12 @@ mod tests {
             Some(json!({"name": "My Org", "slug": "my-org"})),
         )
         .await;
-        let row: (Uuid, String) = sqlx::query_as(
-            "SELECT user_id, role FROM workspace_members WHERE user_id = $1",
-        )
-        .bind(uid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row: (Uuid, String) =
+            sqlx::query_as("SELECT user_id, role FROM workspace_members WHERE user_id = $1")
+                .bind(uid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(row.0, uid);
         assert_eq!(row.1, "owner");
     }
@@ -296,7 +296,9 @@ mod tests {
         .await;
         let res = authed(pool, Method::GET, "/api/workspaces", uid1, None).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -308,7 +310,9 @@ mod tests {
         let uid = create_test_user(&pool).await;
         let res = authed(pool, Method::GET, "/api/workspaces", uid, None).await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 0);
     }

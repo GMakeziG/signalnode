@@ -100,11 +100,7 @@ async fn check_membership(
     }
 }
 
-async fn check_owner(
-    pool: &PgPool,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), StatusCode> {
+async fn check_owner(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> Result<(), StatusCode> {
     match sqlx::query_scalar::<_, String>(
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
     )
@@ -366,7 +362,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::app;
-    use crate::test_helpers::{authed, create_test_user, create_test_workspace, create_test_monitor, TEST_JWT_SECRET};
+    use crate::test_helpers::{
+        authed, create_test_monitor, create_test_user, create_test_workspace, TEST_JWT_SECRET,
+    };
 
     // --- membership guard tests ---
 
@@ -416,7 +414,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["name"], "My Monitor");
         assert_eq!(json["url"], "https://example.com");
@@ -526,7 +526,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -546,7 +548,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -595,7 +599,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "active");
         assert_eq!(json["kind"], "uptime");
@@ -622,7 +628,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["failure_threshold"], 3);
         assert_eq!(json["recovery_threshold"], 2);
@@ -644,7 +652,11 @@ mod tests {
                 Some(body.clone()),
             )
             .await;
-            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "body {body:?} should be 422");
+            assert_eq!(
+                res.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "body {body:?} should be 422"
+            );
         }
     }
 
@@ -665,11 +677,24 @@ mod tests {
         let mid = create_test_monitor(&pool, wid).await;
         archive_monitor(&pool, mid).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors"), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 0, "archived monitor must not appear in default list");
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            0,
+            "archived monitor must not appear in default list"
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -688,9 +713,15 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json.as_array().unwrap().len(), 1, "archived monitor must appear with include_archived=true");
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            1,
+            "archived monitor must appear with include_archived=true"
+        );
         assert_eq!(json[0]["status"], "archived");
     }
 
@@ -702,9 +733,18 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["id"], mid.to_string());
         assert_eq!(json["status"], "active");
@@ -715,7 +755,14 @@ mod tests {
     async fn get_monitor_not_found(pool: PgPool) {
         let uid = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid).await;
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
@@ -726,7 +773,14 @@ mod tests {
         let wid2 = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid1).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid2}/monitors/{mid}"), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid2}/monitors/{mid}"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
@@ -736,7 +790,14 @@ mod tests {
         let uid2 = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid1).await;
         let mid = create_test_monitor(&pool, wid).await;
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid2, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid2,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
@@ -747,7 +808,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
-                    .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
+                    .uri(&format!(
+                        "/api/workspaces/{}/monitors/{}",
+                        Uuid::new_v4(),
+                        Uuid::new_v4()
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -773,7 +838,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["name"], "Renamed");
         assert_eq!(json["url"], "https://example.com");
@@ -786,15 +853,39 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool.clone(), Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"status": "paused"}))).await;
+        let res = authed(
+            pool.clone(),
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({"status": "paused"})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"], "paused");
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"],
+            "paused"
+        );
 
-        let res2 = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"status": "active"}))).await;
+        let res2 = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({"status": "active"})),
+        )
+        .await;
         assert_eq!(res2.status(), StatusCode::OK);
-        let body2 = axum::body::to_bytes(res2.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body2).unwrap()["status"], "active");
+        let body2 = axum::body::to_bytes(res2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body2).unwrap()["status"],
+            "active"
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -803,9 +894,18 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"failure_threshold": 3, "recovery_threshold": 2}))).await;
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({"failure_threshold": 3, "recovery_threshold": 2})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["failure_threshold"], 3);
         assert_eq!(json["recovery_threshold"], 2);
@@ -817,7 +917,14 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"status": "archived"}))).await;
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({"status": "archived"})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -828,7 +935,14 @@ mod tests {
         let mid = create_test_monitor(&pool, wid).await;
         archive_monitor(&pool, mid).await;
 
-        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"name": "X"}))).await;
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({"name": "X"})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -838,7 +952,14 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({}))).await;
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -848,7 +969,14 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, Some(json!({"interval_secs": 0}))).await;
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            Some(json!({"interval_secs": 0})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -857,7 +985,14 @@ mod tests {
         let uid = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid).await;
 
-        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()), uid, Some(json!({"name": "X"}))).await;
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()),
+            uid,
+            Some(json!({"name": "X"})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
@@ -868,7 +1003,14 @@ mod tests {
         let wid = create_test_workspace(&pool, uid1).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool, Method::PATCH, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid2, Some(json!({"name": "X"}))).await;
+        let res = authed(
+            pool,
+            Method::PATCH,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid2,
+            Some(json!({"name": "X"})),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
@@ -879,7 +1021,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::PATCH)
-                    .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
+                    .uri(&format!(
+                        "/api/workspaces/{}/monitors/{}",
+                        Uuid::new_v4(),
+                        Uuid::new_v4()
+                    ))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"name":"X"}"#))
                     .unwrap(),
@@ -910,15 +1056,47 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res = authed(pool.clone(), Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        let res = authed(
+            pool.clone(),
+            Method::DELETE,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
 
-        let list_res = authed(pool.clone(), Method::GET, &format!("/api/workspaces/{wid}/monitors"), uid, None).await;
-        let body = axum::body::to_bytes(list_res.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap().as_array().unwrap().len(), 0);
+        let list_res = authed(
+            pool.clone(),
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            None,
+        )
+        .await;
+        let body = axum::body::to_bytes(list_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
 
-        let archived_res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/monitors?include_archived=true"), uid, None).await;
-        let body2 = axum::body::to_bytes(archived_res.into_body(), usize::MAX).await.unwrap();
+        let archived_res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/monitors?include_archived=true"),
+            uid,
+            None,
+        )
+        .await;
+        let body2 = axum::body::to_bytes(archived_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(json2[0]["id"], mid.to_string());
         assert_eq!(json2[0]["status"], "archived");
@@ -931,7 +1109,14 @@ mod tests {
         let mid = create_test_monitor(&pool, wid).await;
         let uid_member = create_test_member(&pool, wid).await;
 
-        let res = authed(pool, Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid_member, None).await;
+        let res = authed(
+            pool,
+            Method::DELETE,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid_member,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
@@ -941,10 +1126,24 @@ mod tests {
         let wid = create_test_workspace(&pool, uid).await;
         let mid = create_test_monitor(&pool, wid).await;
 
-        let res1 = authed(pool.clone(), Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        let res1 = authed(
+            pool.clone(),
+            Method::DELETE,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res1.status(), StatusCode::NO_CONTENT);
 
-        let res2 = authed(pool, Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{mid}"), uid, None).await;
+        let res2 = authed(
+            pool,
+            Method::DELETE,
+            &format!("/api/workspaces/{wid}/monitors/{mid}"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res2.status(), StatusCode::NO_CONTENT);
     }
 
@@ -953,7 +1152,14 @@ mod tests {
         let uid = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid).await;
 
-        let res = authed(pool, Method::DELETE, &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()), uid, None).await;
+        let res = authed(
+            pool,
+            Method::DELETE,
+            &format!("/api/workspaces/{wid}/monitors/{}", Uuid::new_v4()),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
@@ -961,7 +1167,18 @@ mod tests {
     async fn delete_monitor_workspace_not_found(pool: PgPool) {
         let uid = create_test_user(&pool).await;
 
-        let res = authed(pool, Method::DELETE, &format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()), uid, None).await;
+        let res = authed(
+            pool,
+            Method::DELETE,
+            &format!(
+                "/api/workspaces/{}/monitors/{}",
+                Uuid::new_v4(),
+                Uuid::new_v4()
+            ),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
@@ -972,7 +1189,11 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
-                    .uri(&format!("/api/workspaces/{}/monitors/{}", Uuid::new_v4(), Uuid::new_v4()))
+                    .uri(&format!(
+                        "/api/workspaces/{}/monitors/{}",
+                        Uuid::new_v4(),
+                        Uuid::new_v4()
+                    ))
                     .body(Body::empty())
                     .unwrap(),
             )

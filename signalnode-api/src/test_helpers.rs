@@ -22,16 +22,14 @@ pub async fn create_test_user(pool: &PgPool) -> Uuid {
 
 pub async fn create_test_workspace(pool: &PgPool, user_id: Uuid) -> Uuid {
     let workspace_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(workspace_id)
-    .bind("Test Workspace")
-    .bind(format!("ws-{}", workspace_id))
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)")
+        .bind(workspace_id)
+        .bind("Test Workspace")
+        .bind(format!("ws-{}", workspace_id))
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
     )

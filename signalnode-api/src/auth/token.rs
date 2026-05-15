@@ -1,5 +1,7 @@
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, errors::ErrorKind, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{
+    decode, encode, errors::ErrorKind, DecodingKey, EncodingKey, Header, Validation,
+};
 use serde::{Deserialize, Serialize};
 
 const ACCESS_TOKEN_MINUTES: i64 = 15;
@@ -14,28 +16,64 @@ pub struct Claims {
     pub kind: String,
 }
 
-pub fn encode_access_token(user_id: &str, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn encode_access_token(
+    user_id: &str,
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let exp = (Utc::now() + Duration::minutes(ACCESS_TOKEN_MINUTES)).timestamp();
-    let claims = Claims { sub: user_id.to_string(), exp, kind: KIND_ACCESS.to_string() };
-    encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes()))
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp,
+        kind: KIND_ACCESS.to_string(),
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
 }
 
-pub fn encode_refresh_token(user_id: &str, secret: &str) -> Result<String, jsonwebtoken::errors::Error> {
+pub fn encode_refresh_token(
+    user_id: &str,
+    secret: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let exp = (Utc::now() + Duration::days(REFRESH_TOKEN_DAYS)).timestamp();
-    let claims = Claims { sub: user_id.to_string(), exp, kind: KIND_REFRESH.to_string() };
-    encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes()))
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp,
+        kind: KIND_REFRESH.to_string(),
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
 }
 
-pub fn decode_access_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let data = decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &Validation::default())?;
+pub fn decode_access_token(
+    token: &str,
+    secret: &str,
+) -> Result<Claims, jsonwebtoken::errors::Error> {
+    let data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )?;
     if data.claims.kind != KIND_ACCESS {
         return Err(ErrorKind::InvalidToken.into());
     }
     Ok(data.claims)
 }
 
-pub fn decode_refresh_token(token: &str, secret: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
-    let data = decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &Validation::default())?;
+pub fn decode_refresh_token(
+    token: &str,
+    secret: &str,
+) -> Result<Claims, jsonwebtoken::errors::Error> {
+    let data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )?;
     if data.claims.kind != KIND_REFRESH {
         return Err(ErrorKind::InvalidToken.into());
     }

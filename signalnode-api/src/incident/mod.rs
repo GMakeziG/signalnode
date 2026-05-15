@@ -101,18 +101,18 @@ mod tests {
     use uuid::Uuid;
 
     use crate::app;
-    use crate::test_helpers::{authed, create_test_user, create_test_workspace, create_test_monitor, TEST_JWT_SECRET};
+    use crate::test_helpers::{
+        authed, create_test_monitor, create_test_user, create_test_workspace, TEST_JWT_SECRET,
+    };
 
     async fn create_open_incident(pool: &PgPool, monitor_id: Uuid) -> Uuid {
         let incident_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO incidents (id, monitor_id) VALUES ($1, $2)",
-        )
-        .bind(incident_id)
-        .bind(monitor_id)
-        .execute(pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO incidents (id, monitor_id) VALUES ($1, $2)")
+            .bind(incident_id)
+            .bind(monitor_id)
+            .execute(pool)
+            .await
+            .unwrap();
         incident_id
     }
 
@@ -121,9 +121,18 @@ mod tests {
         let uid = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/incidents"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -146,9 +155,18 @@ mod tests {
         .await
         .unwrap();
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/incidents"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -169,9 +187,18 @@ mod tests {
         create_open_incident(&pool, mid1).await;
         create_open_incident(&pool, mid2).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid1}/incidents"), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid1}/incidents"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -197,18 +224,25 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::query(
-            "INSERT INTO incidents (id, monitor_id, opened_at) VALUES ($1, $2, NOW())",
-        )
-        .bind(newer_id)
-        .bind(mid2)
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO incidents (id, monitor_id, opened_at) VALUES ($1, $2, NOW())")
+            .bind(newer_id)
+            .bind(mid2)
+            .execute(&pool)
+            .await
+            .unwrap();
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/incidents"),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -222,7 +256,14 @@ mod tests {
         let uid2 = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid1).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid2, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/incidents"),
+            uid2,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
@@ -231,7 +272,14 @@ mod tests {
         let uid = create_test_user(&pool).await;
         let _wid = create_test_workspace(&pool, uid).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{}/incidents", Uuid::new_v4()), uid, None).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{}/incidents", Uuid::new_v4()),
+            uid,
+            None,
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 

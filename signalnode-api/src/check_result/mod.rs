@@ -276,7 +276,10 @@ mod tests {
     use uuid::Uuid;
 
     use crate::app;
-    use crate::test_helpers::{authed, create_test_user, create_test_workspace, create_test_monitor, create_test_monitor_thresholds, TEST_JWT_SECRET};
+    use crate::test_helpers::{
+        authed, create_test_monitor, create_test_monitor_thresholds, create_test_user,
+        create_test_workspace, TEST_JWT_SECRET,
+    };
 
     // --- create_check_result tests ---
 
@@ -295,7 +298,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "up");
         assert_eq!(json["latency_ms"], 42);
@@ -320,7 +325,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::CREATED);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "down");
         assert_eq!(json["error_detail"], "connection refused");
@@ -352,7 +359,10 @@ mod tests {
         let res = authed(
             pool,
             Method::POST,
-            &format!("/api/workspaces/{wid}/monitors/{}/check-results", Uuid::new_v4()),
+            &format!(
+                "/api/workspaces/{wid}/monitors/{}/check-results",
+                Uuid::new_v4()
+            ),
             uid,
             Some(json!({"status": "up"})),
         )
@@ -434,7 +444,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 0);
     }
@@ -473,7 +485,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -488,13 +502,11 @@ mod tests {
         let mid1 = create_test_monitor(&pool, wid).await;
         let mid2 = create_test_monitor(&pool, wid).await;
 
-        sqlx::query(
-            "INSERT INTO check_results (monitor_id, status) VALUES ($1, 'up')",
-        )
-        .bind(mid2)
-        .execute(&pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO check_results (monitor_id, status) VALUES ($1, 'up')")
+            .bind(mid2)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let res = authed(
             pool,
@@ -505,7 +517,9 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 0);
     }

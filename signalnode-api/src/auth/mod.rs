@@ -1,13 +1,7 @@
 pub mod password;
 pub mod token;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use uuid::Uuid;
@@ -20,8 +14,7 @@ static DUMMY_HASH: OnceLock<String> = OnceLock::new();
 
 fn dummy_hash() -> &'static str {
     DUMMY_HASH.get_or_init(|| {
-        hash_password("dummy_password_for_timing_mitigation")
-            .expect("dummy hash init")
+        hash_password("dummy_password_for_timing_mitigation").expect("dummy hash init")
     })
 }
 
@@ -83,14 +76,12 @@ async fn register(
         }
     };
 
-    let result = sqlx::query(
-        "INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(&body.email)
-    .bind(&hash)
-    .execute(&state.pool)
-    .await;
+    let result = sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
+        .bind(Uuid::new_v4())
+        .bind(&body.email)
+        .bind(&hash)
+        .execute(&state.pool)
+        .await;
 
     match result {
         Ok(_) => StatusCode::CREATED.into_response(),
@@ -104,16 +95,12 @@ async fn register(
     }
 }
 
-async fn login(
-    State(state): State<AppState>,
-    Json(body): Json<LoginRequest>,
-) -> impl IntoResponse {
-    let row = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, password_hash FROM users WHERE email = $1",
-    )
-    .bind(&body.email)
-    .fetch_optional(&state.pool)
-    .await;
+async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
+    let row =
+        sqlx::query_as::<_, (Uuid, String)>("SELECT id, password_hash FROM users WHERE email = $1")
+            .bind(&body.email)
+            .fetch_optional(&state.pool)
+            .await;
 
     let (user_id, password_hash) = match row {
         Ok(Some(r)) => r,
@@ -129,7 +116,9 @@ async fn login(
     };
 
     let password = body.password.clone();
-    let ok = match tokio::task::spawn_blocking(move || verify_password(&password, &password_hash)).await {
+    let ok = match tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+        .await
+    {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::error!(error = ?e, "password verification error");
@@ -161,7 +150,11 @@ async fn login(
         }
     };
 
-    Json(AuthResponse { access_token, refresh_token }).into_response()
+    Json(AuthResponse {
+        access_token,
+        refresh_token,
+    })
+    .into_response()
 }
 
 async fn refresh(
@@ -174,7 +167,9 @@ async fn refresh(
     };
 
     match encode_access_token(&claims.sub, &state.jwt_secret) {
-        Ok(access_token) => Json(serde_json::json!({ "access_token": access_token })).into_response(),
+        Ok(access_token) => {
+            Json(serde_json::json!({ "access_token": access_token })).into_response()
+        }
         Err(e) => {
             tracing::error!(error = ?e, "access token encoding failed during refresh");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -194,7 +189,11 @@ mod tests {
 
     const TEST_JWT_SECRET: &str = "test-secret-at-least-32-chars-long!";
 
-    async fn post_json(pool: PgPool, uri: &str, body: serde_json::Value) -> axum::response::Response {
+    async fn post_json(
+        pool: PgPool,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::response::Response {
         let app = app(pool, TEST_JWT_SECRET.to_string());
         app.oneshot(
             Request::builder()
@@ -222,18 +221,40 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     async fn register_duplicate_email(pool: PgPool) {
         let pool2 = pool.clone();
-        post_json(pool, "/auth/register", json!({"email": "dup@example.com", "password": "password123"})).await;
-        let res = post_json(pool2, "/auth/register", json!({"email": "dup@example.com", "password": "password456"})).await;
+        post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "dup@example.com", "password": "password123"}),
+        )
+        .await;
+        let res = post_json(
+            pool2,
+            "/auth/register",
+            json!({"email": "dup@example.com", "password": "password456"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 
     #[sqlx::test(migrations = "../migrations")]
     async fn login_success_returns_tokens(pool: PgPool) {
         let pool2 = pool.clone();
-        post_json(pool, "/auth/register", json!({"email": "login@example.com", "password": "mypassword1"})).await;
-        let res = post_json(pool2, "/auth/login", json!({"email": "login@example.com", "password": "mypassword1"})).await;
+        post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "login@example.com", "password": "mypassword1"}),
+        )
+        .await;
+        let res = post_json(
+            pool2,
+            "/auth/login",
+            json!({"email": "login@example.com", "password": "mypassword1"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["access_token"].is_string());
         assert!(json["refresh_token"].is_string());
@@ -242,47 +263,96 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     async fn login_wrong_password_rejected(pool: PgPool) {
         let pool2 = pool.clone();
-        post_json(pool, "/auth/register", json!({"email": "bad@example.com", "password": "correct123"})).await;
-        let res = post_json(pool2, "/auth/login", json!({"email": "bad@example.com", "password": "wrongpass1"})).await;
+        post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "bad@example.com", "password": "correct123"}),
+        )
+        .await;
+        let res = post_json(
+            pool2,
+            "/auth/login",
+            json!({"email": "bad@example.com", "password": "wrongpass1"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test(migrations = "../migrations")]
     async fn login_unknown_user_rejected(pool: PgPool) {
-        let res = post_json(pool, "/auth/login", json!({"email": "ghost@example.com", "password": "somepass1"})).await;
+        let res = post_json(
+            pool,
+            "/auth/login",
+            json!({"email": "ghost@example.com", "password": "somepass1"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test(migrations = "../migrations")]
     async fn register_rejects_empty_email(pool: PgPool) {
-        let res = post_json(pool, "/auth/register", json!({"email": "", "password": "securepass123"})).await;
+        let res = post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "", "password": "securepass123"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[sqlx::test(migrations = "../migrations")]
     async fn register_rejects_invalid_email(pool: PgPool) {
-        let res = post_json(pool, "/auth/register", json!({"email": "notanemail", "password": "securepass123"})).await;
+        let res = post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "notanemail", "password": "securepass123"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[sqlx::test(migrations = "../migrations")]
     async fn register_rejects_short_password(pool: PgPool) {
-        let res = post_json(pool, "/auth/register", json!({"email": "user@example.com", "password": "short"})).await;
+        let res = post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "user@example.com", "password": "short"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[sqlx::test(migrations = "../migrations")]
     async fn refresh_valid_token_returns_access_token(pool: PgPool) {
         let pool2 = pool.clone();
-        post_json(pool, "/auth/register", json!({"email": "refresh@example.com", "password": "password123"})).await;
-        let login_res = post_json(pool2.clone(), "/auth/login", json!({"email": "refresh@example.com", "password": "password123"})).await;
-        let body = axum::body::to_bytes(login_res.into_body(), usize::MAX).await.unwrap();
+        post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "refresh@example.com", "password": "password123"}),
+        )
+        .await;
+        let login_res = post_json(
+            pool2.clone(),
+            "/auth/login",
+            json!({"email": "refresh@example.com", "password": "password123"}),
+        )
+        .await;
+        let body = axum::body::to_bytes(login_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let tokens: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let refresh_token = tokens["refresh_token"].as_str().unwrap();
 
-        let res = post_json(pool2, "/auth/refresh", json!({"refresh_token": refresh_token})).await;
+        let res = post_json(
+            pool2,
+            "/auth/refresh",
+            json!({"refresh_token": refresh_token}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["access_token"].is_string());
     }
@@ -290,7 +360,11 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_rejected() {
         let pool = PgPool::connect_lazy("postgres://unused").unwrap();
-        let token = crate::auth::token::encode_access_token("550e8400-e29b-41d4-a716-446655440000", TEST_JWT_SECRET).unwrap();
+        let token = crate::auth::token::encode_access_token(
+            "550e8400-e29b-41d4-a716-446655440000",
+            TEST_JWT_SECRET,
+        )
+        .unwrap();
         let res = post_json(pool, "/auth/refresh", json!({"refresh_token": token})).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
@@ -298,7 +372,12 @@ mod tests {
     #[tokio::test]
     async fn refresh_invalid_token_rejected() {
         let pool = PgPool::connect_lazy("postgres://unused").unwrap();
-        let res = post_json(pool, "/auth/refresh", json!({"refresh_token": "not.a.valid.token"})).await;
+        let res = post_json(
+            pool,
+            "/auth/refresh",
+            json!({"refresh_token": "not.a.valid.token"}),
+        )
+        .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

@@ -19,7 +19,10 @@ pub struct AppState {
 }
 
 pub fn app(pool: PgPool, jwt_secret: String) -> Router {
-    assert!(!jwt_secret.is_empty(), "JWT_SECRET must be set and non-empty");
+    assert!(
+        !jwt_secret.is_empty(),
+        "JWT_SECRET must be set and non-empty"
+    );
     let state = AppState { pool, jwt_secret };
 
     let protected = Router::new()
@@ -69,7 +72,12 @@ mod tests {
     #[tokio::test]
     async fn health_returns_200() {
         let response = test_app()
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -78,7 +86,12 @@ mod tests {
     #[tokio::test]
     async fn me_missing_token_returns_401() {
         let res = test_app()
-            .oneshot(Request::builder().uri("/api/me").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -129,7 +142,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["id"], TEST_UID);
     }

@@ -196,11 +196,38 @@ async fn create_check_result(
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             }
-        }
-        // Close path added in Task 5
-    }
+        } else {
+            let recent: Vec<String> = match sqlx::query_scalar::<_, String>(
+                "SELECT status FROM check_results \
+                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
+            )
+            .bind(monitor_id)
+            .bind(recovery_threshold)
+            .fetch_all(&mut *tx)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to fetch results for close evaluation");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
 
-    let _ = recovery_threshold; // used in Task 5
+            if recent.len() == recovery_threshold as usize && recent.iter().all(|s| s == "up") {
+                if let Err(e) = sqlx::query(
+                    "UPDATE incidents SET closed_at = NOW() \
+                     WHERE monitor_id = $1 AND closed_at IS NULL",
+                )
+                .bind(monitor_id)
+                .execute(&mut *tx)
+                .await
+                {
+                    tracing::error!(error = ?e, "failed to close incident");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+    }
 
     match tx.commit().await {
         Ok(_) => (StatusCode::CREATED, Json(cr)).into_response(),
@@ -785,6 +812,97 @@ mod tests {
         .await;
         assert_eq!(res.status(), StatusCode::CREATED);
         assert_eq!(open_incident_count(&pool, mid).await, 0);
+    }
+
+    async fn closed_incident_count(pool: &PgPool, monitor_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NOT NULL",
+        )
+        .bind(monitor_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    // --- incident close tests ---
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn close_incident_after_recovery(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        // failure_threshold = 1, recovery_threshold = 2
+        let mid = create_test_monitor_thresholds(&pool, wid, 1, 2).await;
+
+        // Open an incident by inserting a down result at a known old time and opening the incident directly
+        sqlx::query(
+            "INSERT INTO check_results (monitor_id, status, checked_at) \
+             VALUES ($1, 'down', NOW() - INTERVAL '20 seconds')",
+        )
+        .bind(mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO incidents (monitor_id) VALUES ($1)")
+            .bind(mid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(open_incident_count(&pool, mid).await, 1);
+
+        // First up — recovery_threshold not yet met (need 2 consecutive up)
+        sqlx::query(
+            "INSERT INTO check_results (monitor_id, status, checked_at) \
+             VALUES ($1, 'up', NOW() - INTERVAL '5 seconds')",
+        )
+        .bind(mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Second up via API — recovery_threshold = 2 met, incident closes
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "up"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(open_incident_count(&pool, mid).await, 0);
+        assert_eq!(closed_incident_count(&pool, mid).await, 1);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn no_close_below_recovery(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        // failure_threshold = 1, recovery_threshold = 2: need 2 up to close
+        let mid = create_test_monitor_thresholds(&pool, wid, 1, 2).await;
+
+        // Open incident
+        authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(open_incident_count(&pool, mid).await, 1);
+
+        // Only 1 up — not enough to close (need 2)
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(serde_json::json!({"status": "up"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        assert_eq!(open_incident_count(&pool, mid).await, 1);
+        assert_eq!(closed_incident_count(&pool, mid).await, 0);
     }
 
     #[tokio::test]

@@ -135,17 +135,22 @@ Extract into `src/tests/helpers.rs` (behind `#[cfg(test)]`):
 
 Remove duplicates from `workspace`, `monitor`, `check_result`, `incident` modules. No behaviour change — compile + test pass is the acceptance criterion.
 
-### Commit 3 — `notification_channel` module (~16 tests)
+### Commit 2 — migrations (no application tests)
+
+`sqlx::test` runs migrations automatically; schema correctness is validated by every subsequent integration test.
+
+### Commit 3 — `notification_channel` module (~17 tests)
 
 | Test | Asserts |
 |---|---|
-| `create_channel_success` | 201, all response fields present and correct |
+| `create_channel_success` | 201; response contains `id` (UUID), `workspace_id`, `kind`, `target`, `created_at`; `kind` and `target` echo request values |
 | `create_channel_invalid_kind` | 422 |
 | `create_channel_empty_target` | 422 |
 | `create_channel_not_member` | 404 (workspace does not exist) |
 | `create_channel_member_not_owner` | 403 |
 | `create_channel_unauthenticated` | 401 |
 | `list_channels_empty` | 200, `[]` |
+| `list_channels_member_can_read` | non-owner workspace member receives 200 (confirms GET is member-accessible, not owner-only) |
 | `list_channels_ordered_oldest_first` | 200, `created_at ASC` ordering across two channels |
 | `list_channels_scoped_to_workspace` | channels from a second workspace not returned |
 | `list_channels_not_member` | 403 |
@@ -164,7 +169,7 @@ Remove duplicates from `workspace`, `monitor`, `check_result`, `incident` module
 | `no_pending_notifications_when_incident_does_not_open` | Monitor with `failure_threshold = 1`, one channel exists; POST `up` with no open incident → `pending_notifications` count = 0 |
 | `no_pending_notifications_when_no_channels` | Monitor with `failure_threshold = 1`, no channels; POST `down` → incident opens, `pending_notifications` count = 0 |
 
-**Running test count: 96 → ~115** (96 + 16 channel tests + 3 outbox tests).
+**Running test count: 96 → ~116** (96 + 17 channel tests + 3 outbox tests).
 
 ---
 

@@ -5,6 +5,9 @@ pub mod middleware;
 pub mod monitor;
 pub mod workspace;
 
+#[cfg(test)]
+pub mod test_helpers;
+
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use middleware::CurrentUser;
 use sqlx::PgPool;

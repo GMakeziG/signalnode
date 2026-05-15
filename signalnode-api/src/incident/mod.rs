@@ -95,65 +95,13 @@ async fn list_open_incidents(
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
-    use axum::http::{header, Method, Request, StatusCode};
+    use axum::http::{Method, Request, StatusCode};
     use sqlx::PgPool;
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use crate::{app, auth::token::encode_access_token};
-
-    const TEST_JWT_SECRET: &str = "test-secret-at-least-32-chars-long!";
-
-    async fn create_test_user(pool: &PgPool) -> Uuid {
-        let user_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
-            .bind(user_id)
-            .bind(format!("user-{}@test.com", user_id))
-            .bind("not-a-real-hash")
-            .execute(pool)
-            .await
-            .unwrap();
-        user_id
-    }
-
-    async fn create_test_workspace(pool: &PgPool, user_id: Uuid) -> Uuid {
-        let workspace_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(workspace_id)
-        .bind("Test Workspace")
-        .bind(format!("ws-{}", workspace_id))
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
-        )
-        .bind(workspace_id)
-        .bind(user_id)
-        .execute(pool)
-        .await
-        .unwrap();
-        workspace_id
-    }
-
-    async fn create_test_monitor(pool: &PgPool, workspace_id: Uuid) -> Uuid {
-        let monitor_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO monitors (id, workspace_id, name, url, interval_secs) VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(monitor_id)
-        .bind(workspace_id)
-        .bind("Test Monitor")
-        .bind("https://example.com")
-        .bind(60_i32)
-        .execute(pool)
-        .await
-        .unwrap();
-        monitor_id
-    }
+    use crate::app;
+    use crate::test_helpers::{authed, create_test_user, create_test_workspace, create_test_monitor, TEST_JWT_SECRET};
 
     async fn create_open_incident(pool: &PgPool, monitor_id: Uuid) -> Uuid {
         let incident_id = Uuid::new_v4();
@@ -168,32 +116,12 @@ mod tests {
         incident_id
     }
 
-    async fn authed(
-        pool: PgPool,
-        method: Method,
-        uri: &str,
-        user_id: Uuid,
-    ) -> axum::response::Response {
-        let token = encode_access_token(&user_id.to_string(), TEST_JWT_SECRET).unwrap();
-        let req = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("Authorization", format!("Bearer {token}"))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::empty())
-            .unwrap();
-        app(pool, TEST_JWT_SECRET.to_string())
-            .oneshot(req)
-            .await
-            .unwrap()
-    }
-
     #[sqlx::test(migrations = "../migrations")]
     async fn get_open_incidents_empty(pool: PgPool) {
         let uid = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -218,7 +146,7 @@ mod tests {
         .await
         .unwrap();
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -241,7 +169,7 @@ mod tests {
         create_open_incident(&pool, mid1).await;
         create_open_incident(&pool, mid2).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid1}/incidents"), uid).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid1}/incidents"), uid, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -278,7 +206,7 @@ mod tests {
         .await
         .unwrap();
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid, None).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -294,7 +222,7 @@ mod tests {
         let uid2 = create_test_user(&pool).await;
         let wid = create_test_workspace(&pool, uid1).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid2).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{wid}/incidents"), uid2, None).await;
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
@@ -303,7 +231,7 @@ mod tests {
         let uid = create_test_user(&pool).await;
         let _wid = create_test_workspace(&pool, uid).await;
 
-        let res = authed(pool, Method::GET, &format!("/api/workspaces/{}/incidents", Uuid::new_v4()), uid).await;
+        let res = authed(pool, Method::GET, &format!("/api/workspaces/{}/incidents", Uuid::new_v4()), uid, None).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 

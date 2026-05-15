@@ -149,43 +149,8 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    use crate::{app, auth::token::encode_access_token};
-
-    const TEST_JWT_SECRET: &str = "test-secret-at-least-32-chars-long!";
-
-    async fn create_test_user(pool: &PgPool) -> Uuid {
-        let user_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)")
-            .bind(user_id)
-            .bind(format!("user-{}@test.com", user_id))
-            .bind("not-a-real-hash")
-            .execute(pool)
-            .await
-            .unwrap();
-        user_id
-    }
-
-    async fn authed(
-        pool: PgPool,
-        method: Method,
-        uri: &str,
-        user_id: Uuid,
-        body: Option<serde_json::Value>,
-    ) -> axum::response::Response {
-        let token = encode_access_token(&user_id.to_string(), TEST_JWT_SECRET).unwrap();
-        let builder = Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("Authorization", format!("Bearer {token}"));
-        let req = match body {
-            Some(b) => builder
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_string(&b).unwrap()))
-                .unwrap(),
-            None => builder.body(Body::empty()).unwrap(),
-        };
-        app(pool, TEST_JWT_SECRET.to_string()).oneshot(req).await.unwrap()
-    }
+    use crate::app;
+    use crate::test_helpers::{authed, create_test_user, TEST_JWT_SECRET};
 
     // --- create_workspace tests ---
 

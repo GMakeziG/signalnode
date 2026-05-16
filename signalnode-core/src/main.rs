@@ -2,6 +2,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod deliver;
 
 #[tokio::main]
 async fn main() {

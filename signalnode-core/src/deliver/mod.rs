@@ -19,4 +19,12 @@ impl std::fmt::Display for DeliveryError {
     }
 }
 
-impl std::error::Error for DeliveryError {}
+impl std::error::Error for DeliveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DeliveryError::Http(e) => Some(e),
+            DeliveryError::Email(e) => Some(e.as_ref()),
+            DeliveryError::HttpStatus(_) => None,
+        }
+    }
+}

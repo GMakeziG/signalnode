@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use super::DeliveryError;
+use tracing;
 
 pub async fn deliver_webhook(
     client: &reqwest::Client,
@@ -12,12 +13,17 @@ pub async fn deliver_webhook(
         .json(&payload)
         .send()
         .await
-        .map_err(DeliveryError::Http)?;
+        .map_err(|e| {
+            tracing::error!(target = %target, error = %e, "webhook HTTP transport failed");
+            DeliveryError::Http(e)
+        })?;
 
     if response.status().is_success() {
         Ok(())
     } else {
-        Err(DeliveryError::HttpStatus(response.status().as_u16()))
+        let status = response.status().as_u16();
+        tracing::error!(target = %target, status, "webhook returned non-success status");
+        Err(DeliveryError::HttpStatus(status))
     }
 }
 
@@ -45,6 +51,7 @@ mod tests {
         let mock = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(1)
             .mount(&mock)
             .await;
 
@@ -52,6 +59,7 @@ mod tests {
         let result = deliver_webhook(&client, &mock.uri(), serde_json::json!({})).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), DeliveryError::HttpStatus(500)));
+        mock.verify().await;
     }
 
     #[tokio::test]

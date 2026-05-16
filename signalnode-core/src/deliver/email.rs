@@ -1,6 +1,7 @@
 use lettre::{
     message::header::ContentType, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
+use tracing;
 
 use super::DeliveryError;
 
@@ -33,11 +34,16 @@ pub async fn deliver_email(
     subject: &str,
     body: &str,
 ) -> Result<(), DeliveryError> {
-    let msg = build_email_message(&config.from, to, subject, body)
-        .map_err(DeliveryError::Email)?;
+    let msg = build_email_message(&config.from, to, subject, body).map_err(|e| {
+        tracing::error!(to = %to, error = %e, "failed to build email message");
+        DeliveryError::Email(e)
+    })?;
 
     let transport = AsyncSmtpTransport::<Tokio1Executor>::relay(&config.host)
-        .map_err(|e| DeliveryError::Email(e.into()))?
+        .map_err(|e| {
+            tracing::error!(host = %config.host, error = %e, "failed to build SMTP transport");
+            DeliveryError::Email(e.into())
+        })?
         .port(config.port)
         .credentials(lettre::transport::smtp::authentication::Credentials::new(
             config.user.clone(),
@@ -45,7 +51,10 @@ pub async fn deliver_email(
         ))
         .build();
 
-    transport.send(msg).await.map_err(|e| DeliveryError::Email(e.into()))?;
+    transport.send(msg).await.map_err(|e| {
+        tracing::error!(to = %to, host = %config.host, error = %e, "SMTP send failed");
+        DeliveryError::Email(e.into())
+    })?;
     Ok(())
 }
 

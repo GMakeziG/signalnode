@@ -1,10 +1,4 @@
-pub struct SmtpConfig {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub pass: String,
-    pub from: String,
-}
+use crate::deliver::SmtpConfig;
 
 pub struct Config {
     pub database_url: String,

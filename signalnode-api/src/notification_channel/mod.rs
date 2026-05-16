@@ -201,9 +201,7 @@ async fn delete_channel(
     }
 }
 
-pub async fn dispatch_notifications(_pool: &PgPool, _incident_id: Uuid) {
-    // stub — wired in Task 4
-}
+pub async fn dispatch_notifications(_pool: &PgPool, _incident_id: Uuid) {}
 
 #[cfg(test)]
 mod tests {

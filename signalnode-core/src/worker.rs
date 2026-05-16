@@ -112,6 +112,18 @@ pub async fn poll_once(pool: &PgPool, client: &reqwest::Client, smtp: Option<&Sm
     }
 }
 
+pub async fn run_worker(
+    pool: PgPool,
+    client: reqwest::Client,
+    smtp: Option<SmtpConfig>,
+    interval: std::time::Duration,
+) {
+    loop {
+        poll_once(&pool, &client, smtp.as_ref()).await;
+        tokio::time::sleep(interval).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

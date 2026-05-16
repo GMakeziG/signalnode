@@ -1,6 +1,8 @@
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod config;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()

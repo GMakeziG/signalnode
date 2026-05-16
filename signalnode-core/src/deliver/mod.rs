@@ -1,5 +1,7 @@
+pub mod email;
 pub mod webhook;
 
+pub use email::{build_email_message, deliver_email, SmtpConfig};
 pub use webhook::deliver_webhook;
 
 #[derive(Debug)]

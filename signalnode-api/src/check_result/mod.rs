@@ -112,6 +112,8 @@ async fn create_check_result(
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
 
+    let mut opened_incident_id: Option<Uuid> = None;
+
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
@@ -187,14 +189,51 @@ async fn create_check_result(
             };
 
             if recent.len() == failure_threshold as usize && recent.iter().all(|s| s == "down") {
-                if let Err(e) = sqlx::query("INSERT INTO incidents (monitor_id) VALUES ($1)")
-                    .bind(monitor_id)
+                let incident_id = match sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO incidents (monitor_id) VALUES ($1) RETURNING id",
+                )
+                .bind(monitor_id)
+                .fetch_one(&mut *tx)
+                .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "failed to open incident");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+
+                let channels = match sqlx::query_as::<_, (String, String)>(
+                    "SELECT kind, target FROM notification_channels WHERE workspace_id = $1",
+                )
+                .bind(workspace_id)
+                .fetch_all(&mut *tx)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "failed to fetch channels for outbox");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+
+                for (kind, target) in &channels {
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO pending_notifications (incident_id, channel_kind, target) \
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind(incident_id)
+                    .bind(kind)
+                    .bind(target)
                     .execute(&mut *tx)
                     .await
-                {
-                    tracing::error!(error = ?e, "failed to open incident");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    {
+                        tracing::error!(error = ?e, "failed to insert pending notification");
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                 }
+
+                opened_incident_id = Some(incident_id);
             }
         } else {
             let recent: Vec<String> = match sqlx::query_scalar::<_, String>(
@@ -230,7 +269,13 @@ async fn create_check_result(
     }
 
     match tx.commit().await {
-        Ok(_) => (StatusCode::CREATED, Json(cr)).into_response(),
+        Ok(_) => {
+            if let Some(incident_id) = opened_incident_id {
+                crate::notification_channel::dispatch_notifications(&state.pool, incident_id)
+                    .await;
+            }
+            (StatusCode::CREATED, Json(cr)).into_response()
+        }
         Err(e) => {
             tracing::error!(error = ?e, "failed to commit transaction");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -735,6 +780,121 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    // --- outbox fanout tests ---
+
+    async fn pending_notification_count(pool: &PgPool, incident_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_notifications WHERE incident_id = $1",
+        )
+        .bind(incident_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn open_incident_id(pool: &PgPool, monitor_id: Uuid) -> Option<Uuid> {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL LIMIT 1",
+        )
+        .bind(monitor_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn pending_notifications_created_when_incident_opens(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor_thresholds(&pool, wid, 1, 1).await;
+
+        sqlx::query(
+            "INSERT INTO notification_channels (workspace_id, kind, target) \
+             VALUES ($1, 'webhook', 'https://hooks.example.com/test')",
+        )
+        .bind(wid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let iid = open_incident_id(&pool, mid).await.expect("incident should be open");
+        assert_eq!(pending_notification_count(&pool, iid).await, 1);
+
+        let row = sqlx::query_as::<_, (String, String)>(
+            "SELECT channel_kind, target FROM pending_notifications WHERE incident_id = $1",
+        )
+        .bind(iid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "webhook");
+        assert_eq!(row.1, "https://hooks.example.com/test");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn no_pending_notifications_when_incident_does_not_open(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor_thresholds(&pool, wid, 1, 1).await;
+
+        sqlx::query(
+            "INSERT INTO notification_channels (workspace_id, kind, target) \
+             VALUES ($1, 'email', 'alert@example.com')",
+        )
+        .bind(wid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(json!({"status": "up"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pending_notifications",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn no_pending_notifications_when_no_channels(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor_thresholds(&pool, wid, 1, 1).await;
+
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(json!({"status": "down"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let iid = open_incident_id(&pool, mid).await.expect("incident should be open");
+        assert_eq!(pending_notification_count(&pool, iid).await, 0);
     }
 
     // --- incident close tests ---

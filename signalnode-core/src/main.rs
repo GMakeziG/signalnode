@@ -3,6 +3,7 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod deliver;
+mod worker;
 
 #[tokio::main]
 async fn main() {

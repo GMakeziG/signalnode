@@ -4,6 +4,18 @@
 **Phase:** 3
 **Status:** Approved
 
+## Acceptance Criteria
+
+Phase 3 is complete when, with no API calls after initial setup:
+
+1. A monitor with `status = 'active'` and `kind = 'uptime'` receives a `check_result` row approximately every `interval_secs` seconds, written directly by `signalnode-core`.
+2. An incident opens automatically once `failure_threshold` consecutive `"down"` results are recorded.
+3. A `pending_notifications` row is created for each workspace `notification_channel` when an incident opens; the delivery worker delivers it on its next poll.
+4. An open incident closes automatically once `recovery_threshold` consecutive `"up"` results are recorded.
+5. `monitors.last_checked_at` is updated after every check cycle.
+6. A paused or archived monitor is never checked by the engine.
+7. All 11 `checker.rs` tests pass; existing 132 tests continue to pass.
+
 ## Overview
 
 `signalnode-core` currently delivers notifications from the `pending_notifications` outbox. This spec adds the other half of its ADR-0001 charter: polling active Monitors from the database, executing HTTP uptime checks, writing `check_results` directly, and evaluating incident open/close — all without touching the API.
@@ -24,7 +36,7 @@ Each loop runs at its own configurable interval:
 | `WORKER_POLL_INTERVAL_SECS` | 10 | Notification delivery cadence |
 | `CHECKER_POLL_INTERVAL_SECS` | 30 | Monitor check cadence |
 
-`main.rs` awaits both with `tokio::join!`. A new `signalnode-core/src/checker.rs` module mirrors the structure of `worker.rs`. The notification delivery worker (`worker.rs`) is unchanged.
+`main.rs` awaits both handles with `tokio::join!` and unwraps the `JoinHandle` results — if either task panics, the unwrap propagates the panic and the process exits. A process supervisor (e.g. Docker restart policy) is expected to restart it. A new `signalnode-core/src/checker.rs` module mirrors the structure of `worker.rs`. The notification delivery worker (`worker.rs`) is unchanged.
 
 **Bounded duplication:** The incident evaluation and notification fanout logic is duplicated from the API handler into `checker.rs`. This is intentional for Phase 3. A shared-crate extraction is deferred to after Phase 3 is working end-to-end.
 
@@ -69,7 +81,8 @@ For each claimed monitor, stamp `last_checked_at = NOW()` immediately, then comm
 
 ### HTTP Check (no locks held)
 
-For each claimed monitor, concurrently via `tokio::join_all`:
+For each claimed monitor, concurrently via `tokio::join_all` (no concurrency cap for Phase 3 — at most 50 simultaneous connections given the LIMIT):
+
 
 - `GET {url}` using the shared `reqwest::Client` (10 s timeout set in `main.rs`)
 - Measure wall-clock latency with `std::time::Instant`
@@ -80,7 +93,7 @@ For each claimed monitor, concurrently via `tokio::join_all`:
 
 ### Phase 2 — Write Results
 
-Second transaction per monitor (or one transaction covering the whole batch — implementation detail):
+One transaction **per monitor** (not one batch transaction — per-monitor transactions preserve the error isolation guarantee: a DB failure for one monitor never rolls back another's result):
 
 1. `INSERT INTO check_results (monitor_id, status, latency_ms, error_detail) VALUES ...`
 2. Evaluate incident open/close (threshold logic — see below)

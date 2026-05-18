@@ -31,5 +31,5 @@ async fn main() {
     let addr = "0.0.0.0:8080";
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     info!(addr, "signalnode-api listening");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }

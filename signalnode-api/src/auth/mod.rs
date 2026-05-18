@@ -734,4 +734,218 @@ mod tests {
             .unwrap();
         assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
     }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_locked_account_returns_401(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "lock@example.com", "password": "password123"}),
+        )
+        .await;
+
+        // 10 consecutive failures — 10th sets locked_until
+        for _ in 0..10 {
+            post_json(
+                pool.clone(),
+                "/auth/login",
+                json!({"email": "lock@example.com", "password": "wrongpass1"}),
+            )
+            .await;
+        }
+
+        // 11th attempt with CORRECT password still returns 401 (lockout active)
+        let res = post_json(
+            pool.clone(),
+            "/auth/login",
+            json!({"email": "lock@example.com", "password": "password123"}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_lockout_not_triggered_before_threshold(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "almost@example.com", "password": "password123"}),
+        )
+        .await;
+
+        // 9 failures — must NOT lock the account
+        for _ in 0..9 {
+            post_json(
+                pool.clone(),
+                "/auth/login",
+                json!({"email": "almost@example.com", "password": "wrongpass1"}),
+            )
+            .await;
+        }
+
+        // 10th attempt with correct password succeeds (not locked)
+        let res = post_json(
+            pool.clone(),
+            "/auth/login",
+            json!({"email": "almost@example.com", "password": "password123"}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_successful_resets_failure_count(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "reset@example.com", "password": "password123"}),
+        )
+        .await;
+
+        // Fail 9 times
+        for _ in 0..9 {
+            post_json(
+                pool.clone(),
+                "/auth/login",
+                json!({"email": "reset@example.com", "password": "wrongpass1"}),
+            )
+            .await;
+        }
+
+        // Succeed once — DELETE removes the row
+        post_json(
+            pool.clone(),
+            "/auth/login",
+            json!({"email": "reset@example.com", "password": "password123"}),
+        )
+        .await;
+
+        // Fail once more — creates a fresh row with failed_count = 1
+        post_json(
+            pool.clone(),
+            "/auth/login",
+            json!({"email": "reset@example.com", "password": "wrongpass1"}),
+        )
+        .await;
+
+        let count: Option<i32> = sqlx::query_scalar(
+            "SELECT failed_count FROM login_attempts \
+             WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+        )
+        .bind("reset@example.com")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count, Some(1));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_success_after_lockout_expires(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "expired@example.com", "password": "password123"}),
+        )
+        .await;
+
+        // Trigger lockout
+        for _ in 0..10 {
+            post_json(
+                pool.clone(),
+                "/auth/login",
+                json!({"email": "expired@example.com", "password": "wrongpass1"}),
+            )
+            .await;
+        }
+
+        // Manually expire the lock — avoids sleeping in tests
+        sqlx::query(
+            "UPDATE login_attempts \
+             SET locked_until = NOW() - INTERVAL '1 second' \
+             WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+        )
+        .bind("expired@example.com")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Login with correct password now succeeds
+        let res = post_json(
+            pool.clone(),
+            "/auth/login",
+            json!({"email": "expired@example.com", "password": "password123"}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_wrong_password_increments_count(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "count@example.com", "password": "password123"}),
+        )
+        .await;
+
+        for _ in 0..3 {
+            post_json(
+                pool.clone(),
+                "/auth/login",
+                json!({"email": "count@example.com", "password": "wrongpass1"}),
+            )
+            .await;
+        }
+
+        let count: Option<i32> = sqlx::query_scalar(
+            "SELECT failed_count FROM login_attempts \
+             WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+        )
+        .bind("count@example.com")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count, Some(3));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_correct_password_deletes_attempt_row(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "cleanup@example.com", "password": "password123"}),
+        )
+        .await;
+
+        // Fail 5 times to create a row in login_attempts
+        for _ in 0..5 {
+            post_json(
+                pool.clone(),
+                "/auth/login",
+                json!({"email": "cleanup@example.com", "password": "wrongpass1"}),
+            )
+            .await;
+        }
+
+        // Succeed — DELETE should remove the row
+        post_json(
+            pool.clone(),
+            "/auth/login",
+            json!({"email": "cleanup@example.com", "password": "password123"}),
+        )
+        .await;
+
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM login_attempts \
+             WHERE user_id = (SELECT id FROM users WHERE email = $1)",
+        )
+        .bind("cleanup@example.com")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row_count, 0);
+    }
 }

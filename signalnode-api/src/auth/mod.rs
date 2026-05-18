@@ -199,8 +199,9 @@ async fn refresh(
     };
 
     // Atomically consume the old jti — if it was already used (deleted), this returns 0 rows.
-    let deleted = sqlx::query("DELETE FROM refresh_tokens WHERE jti = $1")
+    let deleted = sqlx::query("DELETE FROM refresh_tokens WHERE jti = $1 AND user_id = $2 AND expires_at > NOW()")
         .bind(jti)
+        .bind(user_id)
         .execute(&mut *tx)
         .await;
 
@@ -433,6 +434,7 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["access_token"].is_string());
+        assert!(json["refresh_token"].is_string());
     }
 
     #[tokio::test]
@@ -489,6 +491,11 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["access_token"].is_string());
         assert!(json["refresh_token"].is_string());
+        // The returned refresh token must differ from the one consumed
+        assert_ne!(
+            json["refresh_token"].as_str().unwrap(),
+            refresh_token
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]

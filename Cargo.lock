@@ -1913,6 +1913,7 @@ name = "signalnode-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "lettre",
  "reqwest",
  "serde_json",

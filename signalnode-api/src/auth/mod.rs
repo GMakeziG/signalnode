@@ -139,6 +139,28 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         }
     };
 
+    // Lockout check runs before bcrypt to avoid CPU cost on locked accounts.
+    // Locked accounts return a generic 401 — same as wrong credentials — to
+    // avoid revealing whether the account exists or is locked. See Phase 6 spec.
+    let is_locked = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(\
+            SELECT 1 FROM login_attempts \
+            WHERE user_id = $1 AND locked_until IS NOT NULL AND locked_until > NOW()\
+        )",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await;
+
+    match is_locked {
+        Ok(true) => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = ?e, "database error checking account lockout");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
     let password = body.password.clone();
     let ok = match tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
         .await
@@ -155,7 +177,42 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     };
 
     if !ok {
+        // Atomic upsert: insert first failure or increment existing count.
+        // locked_until is set on the 10th failure (failed_count + 1 >= 10
+        // where failed_count is the pre-update stored value).
+        // The 10th attempt returns a normal wrong-password 401 after setting
+        // locked_until; the 11th attempt hits the lockout check above.
+        let upsert = sqlx::query(
+            "INSERT INTO login_attempts (user_id, failed_count, last_failed_at) \
+             VALUES ($1, 1, NOW()) \
+             ON CONFLICT (user_id) DO UPDATE SET \
+                 failed_count   = login_attempts.failed_count + 1, \
+                 last_failed_at = NOW(), \
+                 locked_until   = CASE \
+                     WHEN login_attempts.failed_count + 1 >= 10 \
+                     THEN NOW() + INTERVAL '15 minutes' \
+                     ELSE login_attempts.locked_until \
+                 END",
+        )
+        .bind(user_id)
+        .execute(&state.pool)
+        .await;
+
+        if let Err(e) = upsert {
+            tracing::error!(error = ?e, "database error recording failed login attempt");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    // Successful login: remove all failure state for this account.
+    if let Err(e) = sqlx::query("DELETE FROM login_attempts WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&state.pool)
+        .await
+    {
+        tracing::error!(error = ?e, "database error clearing login attempts on success");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     let uid = user_id.to_string();

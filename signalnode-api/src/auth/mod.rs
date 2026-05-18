@@ -105,6 +105,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     let (user_id, password_hash) = match row {
         Ok(Some(r)) => r,
         Ok(None) => {
+            // Dummy verify to equalise timing with the found-user path
             let _ = tokio::task::spawn_blocking(|| verify_password("x", dummy_hash())).await;
             return StatusCode::UNAUTHORIZED.into_response();
         }

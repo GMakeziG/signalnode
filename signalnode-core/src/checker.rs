@@ -101,6 +101,8 @@ pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
     .await;
 
     // Phase 2: write results — one transaction per monitor for error isolation
+    // Bounded duplication: incident evaluation mirrors signalnode-api/src/check_result/mod.rs
+    // Extract to a shared crate in Phase 4.
     for outcome in outcomes {
         let mut tx = match pool.begin().await {
             Ok(tx) => tx,
@@ -123,6 +125,131 @@ pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
         {
             tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to insert check_result");
             continue;
+        }
+
+        let open_incident = match sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL LIMIT 1",
+        )
+        .bind(outcome.monitor.id)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to check open incident");
+                if let Err(e) = tx.commit().await {
+                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit after incident check error");
+                }
+                continue;
+            }
+        };
+
+        if open_incident.is_none() {
+            let recent = match sqlx::query_scalar::<_, String>(
+                "SELECT status FROM check_results \
+                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
+            )
+            .bind(outcome.monitor.id)
+            .bind(outcome.monitor.failure_threshold)
+            .fetch_all(&mut *tx)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to fetch results for open evaluation");
+                    if let Err(e) = tx.commit().await {
+                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
+                    }
+                    continue;
+                }
+            };
+
+            if recent.len() == outcome.monitor.failure_threshold as usize
+                && recent.iter().all(|s| s == "down")
+            {
+                let incident_id = match sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO incidents (monitor_id) VALUES ($1) RETURNING id",
+                )
+                .bind(outcome.monitor.id)
+                .fetch_one(&mut *tx)
+                .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to open incident");
+                        if let Err(e) = tx.commit().await {
+                            tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
+                        }
+                        continue;
+                    }
+                };
+
+                let channels = match sqlx::query_as::<_, (String, String)>(
+                    "SELECT kind, target FROM notification_channels WHERE workspace_id = $1",
+                )
+                .bind(outcome.monitor.workspace_id)
+                .fetch_all(&mut *tx)
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to fetch channels for fanout");
+                        if let Err(e) = tx.commit().await {
+                            tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
+                        }
+                        continue;
+                    }
+                };
+
+                for (kind, target) in &channels {
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO pending_notifications (incident_id, channel_kind, target) \
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind(incident_id)
+                    .bind(kind)
+                    .bind(target)
+                    .execute(&mut *tx)
+                    .await
+                    {
+                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to insert pending notification");
+                    }
+                }
+            }
+        } else {
+            let recent = match sqlx::query_scalar::<_, String>(
+                "SELECT status FROM check_results \
+                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
+            )
+            .bind(outcome.monitor.id)
+            .bind(outcome.monitor.recovery_threshold)
+            .fetch_all(&mut *tx)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to fetch results for close evaluation");
+                    if let Err(e) = tx.commit().await {
+                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
+                    }
+                    continue;
+                }
+            };
+
+            if recent.len() == outcome.monitor.recovery_threshold as usize
+                && recent.iter().all(|s| s == "up")
+            {
+                if let Err(e) = sqlx::query(
+                    "UPDATE incidents SET closed_at = NOW() \
+                     WHERE monitor_id = $1 AND closed_at IS NULL",
+                )
+                .bind(outcome.monitor.id)
+                .execute(&mut *tx)
+                .await
+                {
+                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to close incident");
+                }
+            }
         }
 
         if let Err(e) = tx.commit().await {
@@ -344,5 +471,131 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1, "FOR UPDATE SKIP LOCKED must prevent duplicate check_results");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_opens_incident_on_threshold(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let (wid, mid) = insert_monitor(&pool, &mock.uri()).await;
+        sqlx::query("UPDATE monitors SET failure_threshold = 1 WHERE id = $1")
+            .bind(mid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO notification_channels (workspace_id, kind, target) \
+             VALUES ($1, 'webhook', 'https://hooks.example.com/test')",
+        )
+        .bind(wid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        check_once(&pool, &client).await;
+
+        let incident_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(incident_count, 1, "incident should open when failure_threshold is crossed");
+
+        let pn_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_notifications pn \
+             JOIN incidents i ON i.id = pn.incident_id \
+             WHERE i.monitor_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pn_count, 1, "one pending_notification per notification_channel");
+        mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_closes_incident_on_recovery(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
+        sqlx::query("UPDATE monitors SET recovery_threshold = 1 WHERE id = $1")
+            .bind(mid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO incidents (monitor_id) VALUES ($1)")
+            .bind(mid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        check_once(&pool, &client).await;
+
+        let open_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(open_count, 0, "incident should be closed after recovery");
+
+        let closed_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NOT NULL",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(closed_count, 1);
+        mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_no_duplicate_incident(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+
+        let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
+        sqlx::query("UPDATE monitors SET failure_threshold = 1 WHERE id = $1")
+            .bind(mid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO incidents (monitor_id) VALUES ($1)")
+            .bind(mid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        check_once(&pool, &client).await;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "must not open a second incident when one is already open");
     }
 }

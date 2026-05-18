@@ -116,7 +116,7 @@ mod tests {
 
     #[tokio::test]
     async fn me_refresh_token_rejected() {
-        let token = encode_refresh_token(TEST_UID, TEST_JWT).unwrap();
+        let (token, _, _) = encode_refresh_token(TEST_UID, TEST_JWT).unwrap();
         let res = test_app()
             .oneshot(
                 Request::builder()

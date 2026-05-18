@@ -142,13 +142,14 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let refresh_token = match encode_refresh_token(&uid, &state.jwt_secret) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(error = ?e, "refresh token encoding failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let (refresh_token, _refresh_jti, _refresh_expires_at) =
+        match encode_refresh_token(&uid, &state.jwt_secret) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = ?e, "refresh token encoding failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
 
     Json(AuthResponse {
         access_token,

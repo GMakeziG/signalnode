@@ -27,13 +27,24 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
-    let interval = Duration::from_secs(cfg.poll_interval_secs);
+    let worker_interval = Duration::from_secs(cfg.poll_interval_secs);
+    let checker_interval = Duration::from_secs(cfg.checker_poll_interval_secs);
 
     info!(
-        interval_secs = cfg.poll_interval_secs,
+        worker_interval_secs = cfg.poll_interval_secs,
+        checker_interval_secs = cfg.checker_poll_interval_secs,
         smtp_configured = cfg.smtp.is_some(),
-        "starting notification delivery worker"
+        "signalnode-core starting workers"
     );
 
-    worker::run_worker(pool, client, cfg.smtp, interval).await;
+    let h1 = tokio::spawn(worker::run_worker(
+        pool.clone(),
+        client.clone(),
+        cfg.smtp,
+        worker_interval,
+    ));
+    let h2 = tokio::spawn(checker::run_checker(pool, client, checker_interval));
+    let (r1, r2) = tokio::join!(h1, h2);
+    r1.expect("delivery worker panicked");
+    r2.expect("checker panicked");
 }

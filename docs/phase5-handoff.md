@@ -1,14 +1,15 @@
-# Phase 5 Handoff — Auth Rate Limiting Design
+# Phase 5 Handoff — Auth Rate Limiting
 
 **Date:** 2026-05-18  
-**Branch:** `main` (pushed to `origin/main`, commit range `59abe48`–`294893c`)  
-**Tests:** 122 API / 29 core — all green (151 total)
+**Branch:** `main` (pushed to `origin/main`, commit range `59abe48`–`df1fa9a`)  
+**Status:** **COMPLETE**  
+**Tests:** 125 API / 29 core — all green (154 total)
 
 ---
 
 ## What Shipped
 
-Design spec and implementation plan for per-route IP-based rate limiting on the three auth endpoints using `tower_governor`. No production code written yet.
+Per-route IP-based rate limiting on `/auth/login` (10/min), `/auth/register` (5/min), and `/auth/refresh` (30/min) using `tower_governor 0.8` with `PeerIpKeyExtractor`. Three integration tests assert the 429 path without sleeps via a `tight_app` helper (burst=1).
 
 | Commit | Change |
 |--------|--------|
@@ -17,6 +18,11 @@ Design spec and implementation plan for per-route IP-based rate limiting on the 
 | `73bf948` | Spec fix: r1 asserts 422 (deterministic), Arc-clone note, Acceptance Criteria section added |
 | `7a8d987` | Spec fix: off-by-one in acceptance criteria (11th/6th/31st request rejected) |
 | `294893c` | Implementation plan: 4 tasks / 18 steps, TDD red→green, all code included |
+| `faca1f9` | deps(api): add tower_governor 0.8; promote tower to prod dep |
+| `4be2b71` | test(auth): add failing 429 rate-limit tests (red) |
+| `e35e942` | feat(auth): per-route rate limiting via tower_governor |
+| `0b959d3` | style(auth): fix clippy warnings (pre-existing unused imports in monitor/notification_channel) |
+| `df1fa9a` | fix(api): inject ConnectInfo for PeerIpKeyExtractor in production server (main.rs) |
 
 ---
 
@@ -49,7 +55,7 @@ Full spec: `docs/superpowers/specs/2026-05-18-auth-rate-limiting-design.md`
 
 ---
 
-## Architecture State (post-Phase 4, pre-Phase 5)
+## Architecture State (post-Phase 5)
 
 `signalnode-api/src/auth/`:
 
@@ -60,10 +66,16 @@ token.rs    — Claims { sub, exp, kind, jti: Option<String> }
               decode_access_token  — enforces kind = "access"
               decode_refresh_token — enforces kind = "refresh" AND jti.is_some()
 
-mod.rs      — router(): POST /register, /login, /refresh  ← GovernorLayer goes here
+mod.rs      — router(): POST /register (GovernorLayer 5/min, burst 5)
+                        POST /login    (GovernorLayer 10/min, burst 10)
+                        POST /refresh  (GovernorLayer 30/min, burst 30)
               login:   Argon2id verify → encode tokens → INSERT jti → 201
               refresh: decode JWT → DELETE old jti (401 if 0 rows) → INSERT new jti → AuthResponse
 ```
+
+`main.rs`: `axum::serve` uses `into_make_service_with_connect_info::<SocketAddr>()` so `PeerIpKeyExtractor` receives the peer IP in production.
+
+**429 test coverage:** `login_rate_limited_returns_429`, `register_rate_limited_returns_429`, `refresh_rate_limited_returns_429` — each fires two requests through a `tight_app` (burst=1, per_second=3600); r1→422 (extractor rejects `{}`), r2→429 (burst exhausted).
 
 `refresh_tokens` table (migration `20260518000012`):
 
@@ -77,28 +89,26 @@ INDEX refresh_tokens_user_id_idx ON (user_id)
 
 ---
 
-## Known Technical Debt (updated)
+## Known Technical Debt (updated post-Phase 5)
 
 | Item | Severity | Notes |
 |---|---|---|
-| No rate limiting on auth endpoints | **High** | **Phase 5 — implementation plan ready** |
+| ~~No rate limiting on auth endpoints~~ | ~~High~~ | **Done — Phase 5** |
+| No account lockout after failed logins | **High** | **Recommended next (Phase 6).** Requires HITL review before designing. Complements rate limiting; rate limits slow brute-force, lockout stops it. |
 | `refresh_tokens` grows indefinitely | Medium | Expired rows never purged. Needs scheduled `DELETE WHERE expires_at < NOW()`. |
 | No structured error response bodies | Medium | Bare status codes. Clients can't distinguish error types. |
-| No account lockout after failed logins | Medium | Requires HITL review before implementing. |
-| Incident logic duplicated between `checker.rs` and `signalnode-api/src/check_result/mod.rs` | Medium | Extract to `signalnode-shared` crate (Phase 6+). |
+| Incident logic duplicated between `checker.rs` and `signalnode-api/src/check_result/mod.rs` | Medium | Extract to `signalnode-shared` crate. |
 | `check_membership` / `check_owner` duplicated across three API modules | Low | Extraction deferred. |
-| Unused imports in `monitor/mod.rs` and `notification_channel/mod.rs` | Low | Pre-existing warnings. |
 
 ---
 
-## Test Counts (as of 2026-05-18 Phase 5 design)
+## Test Counts (post-Phase 5 implementation)
 
 | Crate | Tests | Status |
 |-------|-------|--------|
-| signalnode-api | 122 | all pass |
+| signalnode-api | 125 | all pass (includes 3 new 429 tests) |
 | signalnode-core | 29 | all pass |
-
-After Phase 5 implementation: signalnode-api should reach **125 tests** (3 new 429 tests).
+| **Total** | **154** | **all green** |
 
 **Test commands:**
 ```bash

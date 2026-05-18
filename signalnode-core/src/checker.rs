@@ -598,4 +598,42 @@ mod tests {
         .unwrap();
         assert_eq!(count, 1, "must not open a second incident when one is already open");
     }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn run_checker_loops(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&mock)
+            .await;
+
+        let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
+        let client = reqwest::Client::new();
+
+        // Tick 1
+        check_once(&pool, &client).await;
+
+        // Simulate the monitor's interval having elapsed by backdating last_checked_at
+        sqlx::query(
+            "UPDATE monitors \
+             SET last_checked_at = last_checked_at - INTERVAL '2 minutes' \
+             WHERE id = $1",
+        )
+        .bind(mid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Tick 2
+        check_once(&pool, &client).await;
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM check_results WHERE monitor_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2, "two check_once ticks should produce two check_results");
+    }
 }

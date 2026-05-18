@@ -105,7 +105,6 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     let (user_id, password_hash) = match row {
         Ok(Some(r)) => r,
         Ok(None) => {
-            // Dummy verify to equalise timing with the found-user path
             let _ = tokio::task::spawn_blocking(|| verify_password("x", dummy_hash())).await;
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -142,7 +141,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let (refresh_token, _refresh_jti, _refresh_expires_at) =
+    let (refresh_token, refresh_jti, refresh_expires_at) =
         match encode_refresh_token(&uid, &state.jwt_secret) {
             Ok(t) => t,
             Err(e) => {
@@ -150,6 +149,20 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
+
+    let result = sqlx::query(
+        "INSERT INTO refresh_tokens (jti, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(refresh_jti)
+    .bind(user_id)
+    .bind(refresh_expires_at)
+    .execute(&state.pool)
+    .await;
+
+    if let Err(e) = result {
+        tracing::error!(error = ?e, "failed to persist refresh token");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     Json(AuthResponse {
         access_token,
@@ -380,5 +393,27 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_persists_refresh_token_in_db(pool: PgPool) {
+        let pool2 = pool.clone();
+        post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "jti@example.com", "password": "password123"}),
+        )
+        .await;
+        post_json(
+            pool2.clone(),
+            "/auth/login",
+            json!({"email": "jti@example.com", "password": "password123"}),
+        )
+        .await;
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM refresh_tokens")
+            .fetch_one(&pool2)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

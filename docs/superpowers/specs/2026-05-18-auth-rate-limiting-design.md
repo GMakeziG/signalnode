@@ -194,9 +194,9 @@ Phase 5 is done when all of the following are true:
 1. `cargo test` passes — all 151 existing tests green, plus 3 new 429 tests = **154 total**.
 2. `cargo clippy` is clean (no new warnings).
 3. `GET /health` returns 200 — unaffected by auth rate limiting.
-4. `POST /auth/login` returns 429 after 10 requests from the same IP within one minute.
-5. `POST /auth/register` returns 429 after 5 requests from the same IP within one minute.
-6. `POST /auth/refresh` returns 429 after 30 requests from the same IP within one minute.
+4. `POST /auth/login` — the 11th request from the same IP within the window returns 429; requests 1–10 are passed to the handler.
+5. `POST /auth/register` — the 6th request from the same IP within the window returns 429; requests 1–5 are passed to the handler.
+6. `POST /auth/refresh` — the 31st request from the same IP within the window returns 429; requests 1–30 are passed to the handler.
 7. All existing auth tests (`register_success`, `login_success_returns_tokens`, etc.) continue to
    pass — each creates a fresh app instance with empty rate-limit state, so none trigger 429.
 

@@ -2,6 +2,7 @@ use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod checker;
 mod config;
 mod deliver;
 mod worker;

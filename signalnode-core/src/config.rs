@@ -9,30 +9,28 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let database_url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set");
+        Self::from_provider(|k| std::env::var(k).ok())
+    }
 
-        let poll_interval_secs = std::env::var("WORKER_POLL_INTERVAL_SECS")
-            .ok()
+    // Separated so tests can inject vars without touching the process environment.
+    fn from_provider(get: impl Fn(&str) -> Option<String>) -> Self {
+        let database_url = get("DATABASE_URL").expect("DATABASE_URL must be set");
+
+        let poll_interval_secs = get("WORKER_POLL_INTERVAL_SECS")
             .map(|v| v.parse::<u64>().expect("WORKER_POLL_INTERVAL_SECS must be a positive integer"))
             .unwrap_or(10);
 
-        let smtp = std::env::var("SMTP_HOST").ok().map(|host| SmtpConfig {
+        let smtp = get("SMTP_HOST").map(|host| SmtpConfig {
             host,
-            port: std::env::var("SMTP_PORT")
-                .ok()
+            port: get("SMTP_PORT")
                 .map(|v| v.parse::<u16>().expect("SMTP_PORT must be a valid port number"))
                 .unwrap_or(587),
-            user: std::env::var("SMTP_USER")
-                .expect("SMTP_USER required when SMTP_HOST is set"),
-            pass: std::env::var("SMTP_PASS")
-                .expect("SMTP_PASS required when SMTP_HOST is set"),
-            from: std::env::var("SMTP_FROM")
-                .expect("SMTP_FROM required when SMTP_HOST is set"),
+            user: get("SMTP_USER").expect("SMTP_USER required when SMTP_HOST is set"),
+            pass: get("SMTP_PASS").expect("SMTP_PASS required when SMTP_HOST is set"),
+            from: get("SMTP_FROM").expect("SMTP_FROM required when SMTP_HOST is set"),
         });
 
-        let checker_poll_interval_secs = std::env::var("CHECKER_POLL_INTERVAL_SECS")
-            .ok()
+        let checker_poll_interval_secs = get("CHECKER_POLL_INTERVAL_SECS")
             .map(|v| v.parse::<u64>().expect("CHECKER_POLL_INTERVAL_SECS must be a positive integer"))
             .unwrap_or(30);
 
@@ -43,119 +41,68 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
-    fn with_env<F: FnOnce()>(f: F) {
-        let saved = std::env::var("DATABASE_URL").ok();
-        f();
-        match saved {
-            Some(val) => std::env::set_var("DATABASE_URL", val),
-            None => std::env::remove_var("DATABASE_URL"),
-        }
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
     }
 
     #[test]
-    #[serial]
     #[should_panic(expected = "DATABASE_URL must be set")]
     fn from_env_panics_without_database_url() {
-        // save + restore happens manually since #[should_panic] unwinds
-        let saved = std::env::var("DATABASE_URL").ok();
-        std::env::remove_var("DATABASE_URL");
-        std::env::remove_var("SMTP_HOST");
-        let result = std::panic::catch_unwind(Config::from_env);
-        match saved {
-            Some(val) => std::env::set_var("DATABASE_URL", val),
-            None => {}
-        }
-        // re-panic so #[should_panic] works
-        if let Err(e) = result {
-            std::panic::resume_unwind(e);
-        }
+        Config::from_provider(|_| None);
     }
 
     #[test]
-    #[serial]
     fn from_env_uses_poll_interval_default() {
-        with_env(|| {
-            std::env::set_var("DATABASE_URL", "postgres://unused");
-            std::env::remove_var("SMTP_HOST");
-            std::env::remove_var("WORKER_POLL_INTERVAL_SECS");
-            let cfg = Config::from_env();
-            assert_eq!(cfg.poll_interval_secs, 10);
-        });
+        let cfg = Config::from_provider(vars(&[("DATABASE_URL", "postgres://unused")]));
+        assert_eq!(cfg.poll_interval_secs, 10);
     }
 
     #[test]
-    #[serial]
     fn from_env_parses_poll_interval() {
-        with_env(|| {
-            std::env::set_var("DATABASE_URL", "postgres://unused");
-            std::env::set_var("WORKER_POLL_INTERVAL_SECS", "30");
-            std::env::remove_var("SMTP_HOST");
-            let cfg = Config::from_env();
-            assert_eq!(cfg.poll_interval_secs, 30);
-            std::env::remove_var("WORKER_POLL_INTERVAL_SECS");
-        });
+        let cfg = Config::from_provider(vars(&[
+            ("DATABASE_URL", "postgres://unused"),
+            ("WORKER_POLL_INTERVAL_SECS", "30"),
+        ]));
+        assert_eq!(cfg.poll_interval_secs, 30);
     }
 
     #[test]
-    #[serial]
     fn from_env_smtp_none_when_no_host() {
-        with_env(|| {
-            std::env::set_var("DATABASE_URL", "postgres://unused");
-            std::env::remove_var("SMTP_HOST");
-            let cfg = Config::from_env();
-            assert!(cfg.smtp.is_none());
-        });
+        let cfg = Config::from_provider(vars(&[("DATABASE_URL", "postgres://unused")]));
+        assert!(cfg.smtp.is_none());
     }
 
     #[test]
-    #[serial]
     fn from_env_uses_checker_interval_default() {
-        with_env(|| {
-            std::env::set_var("DATABASE_URL", "postgres://unused");
-            std::env::remove_var("SMTP_HOST");
-            std::env::remove_var("CHECKER_POLL_INTERVAL_SECS");
-            let cfg = Config::from_env();
-            assert_eq!(cfg.checker_poll_interval_secs, 30);
-        });
+        let cfg = Config::from_provider(vars(&[("DATABASE_URL", "postgres://unused")]));
+        assert_eq!(cfg.checker_poll_interval_secs, 30);
     }
 
     #[test]
-    #[serial]
     fn from_env_parses_checker_interval() {
-        with_env(|| {
-            std::env::set_var("DATABASE_URL", "postgres://unused");
-            std::env::set_var("CHECKER_POLL_INTERVAL_SECS", "60");
-            std::env::remove_var("SMTP_HOST");
-            let cfg = Config::from_env();
-            assert_eq!(cfg.checker_poll_interval_secs, 60);
-            std::env::remove_var("CHECKER_POLL_INTERVAL_SECS");
-        });
+        let cfg = Config::from_provider(vars(&[
+            ("DATABASE_URL", "postgres://unused"),
+            ("CHECKER_POLL_INTERVAL_SECS", "60"),
+        ]));
+        assert_eq!(cfg.checker_poll_interval_secs, 60);
     }
 
     #[test]
-    #[serial]
     fn from_env_smtp_some_with_all_vars() {
-        with_env(|| {
-            std::env::set_var("DATABASE_URL", "postgres://unused");
-            std::env::set_var("SMTP_HOST", "smtp.example.com");
-            std::env::set_var("SMTP_PORT", "465");
-            std::env::set_var("SMTP_USER", "user@example.com");
-            std::env::set_var("SMTP_PASS", "secret");
-            std::env::set_var("SMTP_FROM", "from@example.com");
-            let cfg = Config::from_env();
-            let smtp = cfg.smtp.expect("smtp should be Some");
-            assert_eq!(smtp.host, "smtp.example.com");
-            assert_eq!(smtp.port, 465);
-            assert_eq!(smtp.user, "user@example.com");
-            assert_eq!(smtp.pass, "secret");
-            assert_eq!(smtp.from, "from@example.com");
-            std::env::remove_var("SMTP_HOST");
-            std::env::remove_var("SMTP_PORT");
-            std::env::remove_var("SMTP_USER");
-            std::env::remove_var("SMTP_PASS");
-            std::env::remove_var("SMTP_FROM");
-        });
+        let cfg = Config::from_provider(vars(&[
+            ("DATABASE_URL", "postgres://unused"),
+            ("SMTP_HOST", "smtp.example.com"),
+            ("SMTP_PORT", "465"),
+            ("SMTP_USER", "user@example.com"),
+            ("SMTP_PASS", "secret"),
+            ("SMTP_FROM", "from@example.com"),
+        ]));
+        let smtp = cfg.smtp.expect("smtp should be Some");
+        assert_eq!(smtp.host, "smtp.example.com");
+        assert_eq!(smtp.port, 465);
+        assert_eq!(smtp.user, "user@example.com");
+        assert_eq!(smtp.pass, "secret");
+        assert_eq!(smtp.from, "from@example.com");
     }
 }

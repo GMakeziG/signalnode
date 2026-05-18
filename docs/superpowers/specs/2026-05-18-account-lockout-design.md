@@ -85,7 +85,8 @@ The `login` handler in `signalnode-api/src/auth/mod.rs` gains two DB operations 
 
 - The upsert is a single atomic Postgres statement — no TOCTOU race between reading and writing `failed_count`.
 - `login_attempts.failed_count + 1` in the `CASE` refers to the pre-update stored value; `+ 1` represents the incoming new value, so the `>= 10` condition fires exactly on the 10th consecutive failure.
-- Lockout check runs before bcrypt — locked accounts never pay the bcrypt CPU cost.
+- The **10th** failed attempt goes through the normal wrong-password path: bcrypt runs, the upsert sets `locked_until`, and a standard wrong-password 401 is returned. The account is locked *after* that response. The **11th** attempt is the first to be caught by the lockout check at step 2 and short-circuits before bcrypt.
+- Lockout check runs before bcrypt — locked accounts (11th attempt onwards) never pay the bcrypt CPU cost.
 - Successful login deletes the row regardless of current `failed_count` — full reset, no partial state.
 - The `locked_until` column is not explicitly reset to NULL on success; the row deletion handles cleanup.
 
@@ -107,7 +108,7 @@ Six new `#[sqlx::test]` cases in `signalnode-api/src/auth/mod.rs`:
 
 | Test | What it verifies |
 |---|---|
-| `login_locked_account_returns_401` | Register user, fail login 10×, assert 11th attempt returns 401 |
+| `login_locked_account_returns_401` | Register user, fail login 10× (10th sets locked_until, returns wrong-password 401), assert 11th attempt hits lockout path and returns 401 |
 | `login_lockout_not_triggered_before_threshold` | Fail 9×, assert 10th attempt still reaches password check (returns 401 for wrong pw, not lockout path) |
 | `login_successful_resets_failure_count` | Fail 9×, succeed once, fail again — assert `failed_count = 1` in `login_attempts` |
 | `login_success_after_lockout_expires` | Lock account, manually set `locked_until` to a past timestamp via direct DB update, assert next attempt reaches password check |

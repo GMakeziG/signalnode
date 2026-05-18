@@ -3,7 +3,9 @@ pub mod token;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::sync::OnceLock;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use uuid::Uuid;
 
 use crate::AppState;
@@ -49,10 +51,32 @@ pub struct AuthResponse {
 }
 
 pub fn router() -> Router<AppState> {
+    let register_config = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(12)
+            .burst_size(5)
+            .finish()
+            .unwrap(),
+    );
+    let login_config = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(6)
+            .burst_size(10)
+            .finish()
+            .unwrap(),
+    );
+    let refresh_config = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(2)
+            .burst_size(30)
+            .finish()
+            .unwrap(),
+    );
+
     Router::new()
-        .route("/register", post(register))
-        .route("/login", post(login))
-        .route("/refresh", post(refresh))
+        .route("/register", post(register).layer(GovernorLayer::new(register_config)))
+        .route("/login", post(login).layer(GovernorLayer::new(login_config)))
+        .route("/refresh", post(refresh).layer(GovernorLayer::new(refresh_config)))
 }
 
 async fn register(
@@ -267,7 +291,9 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
     use std::net::SocketAddr;
+    use std::sync::Arc;
     use tower::ServiceExt;
+    use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 
     use crate::app;
 
@@ -276,10 +302,31 @@ mod tests {
             pool,
             jwt_secret: TEST_JWT_SECRET.to_string(),
         };
+        let register_config = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(3600)
+                .burst_size(1)
+                .finish()
+                .unwrap(),
+        );
+        let login_config = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(3600)
+                .burst_size(1)
+                .finish()
+                .unwrap(),
+        );
+        let refresh_config = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(3600)
+                .burst_size(1)
+                .finish()
+                .unwrap(),
+        );
         Router::new()
-            .route("/login", post(super::login))
-            .route("/register", post(super::register))
-            .route("/refresh", post(super::refresh))
+            .route("/login", post(super::login).layer(GovernorLayer::new(login_config)))
+            .route("/register", post(super::register).layer(GovernorLayer::new(register_config)))
+            .route("/refresh", post(super::refresh).layer(GovernorLayer::new(refresh_config)))
             .with_state(state)
     }
 
@@ -296,6 +343,7 @@ mod tests {
                 .method(Method::POST)
                 .uri(uri)
                 .header(header::CONTENT_TYPE, "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
                 .body(Body::from(serde_json::to_string(&body).unwrap()))
                 .unwrap(),
         )

@@ -21,7 +21,8 @@ struct CheckOutcome {
     error_detail: Option<String>,
 }
 
-pub async fn check_once(pool: &PgPool, _client: &reqwest::Client) {
+pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
+    // Phase 1: claim due monitors in a short transaction, stamp last_checked_at immediately
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
@@ -67,6 +68,68 @@ pub async fn check_once(pool: &PgPool, _client: &reqwest::Client) {
 
     if let Err(e) = tx.commit().await {
         tracing::error!(error = ?e, "check_once: failed to commit claim transaction");
+        return;
+    }
+
+    // HTTP checks — no DB locks held; all monitors checked concurrently
+    let outcomes: Vec<CheckOutcome> = join_all(monitors.into_iter().map(|m| {
+        let client = client.clone();
+        async move {
+            let start = Instant::now();
+            match client.get(&m.url).send().await {
+                Ok(resp) if resp.status().is_success() => CheckOutcome {
+                    latency_ms: Some(start.elapsed().as_millis() as i32),
+                    status: "up",
+                    error_detail: None,
+                    monitor: m,
+                },
+                Ok(resp) => CheckOutcome {
+                    latency_ms: Some(start.elapsed().as_millis() as i32),
+                    status: "down",
+                    error_detail: Some(format!("HTTP {}", resp.status().as_u16())),
+                    monitor: m,
+                },
+                Err(e) => CheckOutcome {
+                    latency_ms: None,
+                    status: "down",
+                    error_detail: Some(e.to_string()),
+                    monitor: m,
+                },
+            }
+        }
+    }))
+    .await;
+
+    // Phase 2: write results — one transaction per monitor for error isolation
+    for outcome in outcomes {
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to begin write transaction");
+                continue;
+            }
+        };
+
+        if let Err(e) = sqlx::query(
+            "INSERT INTO check_results (monitor_id, status, latency_ms, error_detail) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(outcome.monitor.id)
+        .bind(outcome.status)
+        .bind(outcome.latency_ms)
+        .bind(outcome.error_detail.as_deref())
+        .execute(&mut *tx)
+        .await
+        {
+            tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to insert check_result");
+            continue;
+        }
+
+        if let Err(e) = tx.commit().await {
+            tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit write transaction");
+        } else {
+            tracing::info!(monitor_id = %outcome.monitor.id, status = outcome.status, "check result written");
+        }
     }
 }
 
@@ -189,5 +252,97 @@ mod tests {
         .await
         .unwrap();
         assert!(last_checked_at.is_some(), "last_checked_at should be stamped after a check cycle");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_writes_check_result_for_due_monitor(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
+        let client = reqwest::Client::new();
+        check_once(&pool, &client).await;
+
+        let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "up");
+        assert!(row.1.is_some(), "latency_ms should be recorded for 200 response");
+        assert!(row.2.is_none(), "error_detail should be None for up");
+        mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_marks_down_on_non_2xx(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
+        let client = reqwest::Client::new();
+        check_once(&pool, &client).await;
+
+        let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "down");
+        assert!(row.1.is_some(), "latency_ms should be recorded even for non-2xx");
+        assert_eq!(row.2.as_deref(), Some("HTTP 500"));
+        mock.verify().await;
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_marks_down_on_connect_error(pool: PgPool) {
+        let (_wid, mid) = insert_monitor(&pool, "http://127.0.0.1:1").await;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        check_once(&pool, &client).await;
+
+        let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "down");
+        assert!(row.1.is_none(), "latency_ms should be None when no response received");
+        assert!(row.2.is_some(), "error_detail should contain the error message");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_concurrent_no_duplicate(pool: PgPool) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&mock)
+            .await;
+
+        let (_wid, _mid) = insert_monitor(&pool, &mock.uri()).await;
+        let client = reqwest::Client::new();
+        tokio::join!(check_once(&pool, &client), check_once(&pool, &client));
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_results")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "FOR UPDATE SKIP LOCKED must prevent duplicate check_results");
     }
 }

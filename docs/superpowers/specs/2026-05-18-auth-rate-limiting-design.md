@@ -37,11 +37,14 @@ and brute-force attacks. Any IP can hammer them without consequence.
 
 ## Rate Limits
 
-| Route | Tokens / min | `per_second(N)` | `burst_size` | Rationale |
+| Route | Tokens / min | `per_second(N)` ¹ | `burst_size` | Rationale |
 |---|---|---|---|---|
 | `POST /auth/register` | 5 | `per_second(12)` | 5 | Account creation is rarely burst-legitimate |
 | `POST /auth/login` | 10 | `per_second(6)` | 10 | Allows a few fast retries before throttling |
 | `POST /auth/refresh` | 30 | `per_second(2)` | 30 | Background token rotation is more frequent |
+
+¹ `per_second(N)` means one token replenished every N seconds (N is the period, not the rate).
+A burst of B tokens means up to B requests are allowed before replenishment kicks in.
 
 All keyed by remote IP via `PeerIpKeyExtractor` (reads `ConnectInfo<SocketAddr>`).
 
@@ -126,9 +129,14 @@ Request::builder()
 
 ### New 429 tests — three, one per route
 
-A `#[cfg(test)]` function `tight_app(pool: PgPool) -> Router` builds the auth router with
-`burst_size(1)` and `per_second(3600)` (one token per hour). After the first request consumes the
-burst, the second is immediately rate-limited with no sleep required.
+A `#[cfg(test)]` function `tight_app(pool: PgPool) -> Router` (inside `auth/mod.rs`) builds a
+standalone router — **no `/auth/` nesting prefix** — with `burst_size(1)` and `per_second(3600)`
+(one token per hour) for each route. Routes are exposed at `/login`, `/register`, `/refresh`.
+Each route gets its own `GovernorConfig` instance (mirroring production layout) so the three
+token buckets are independent.
+
+After the first request consumes the burst token, the second is immediately rate-limited with no
+sleep required.
 
 Because `GovernorLayer` holds the rate-limiter state behind `Arc`, cloning the `Router` shares the
 same token bucket. The two `.oneshot()` calls on clones of the same router instance see the same
@@ -140,20 +148,35 @@ async fn login_rate_limited_returns_429() {
     let pool = PgPool::connect_lazy("postgres://unused").unwrap();
     let app = tight_app(pool);
 
-    // First request passes through the governor (handler may return anything)
-    let r1 = app.clone().oneshot(make_login_req()).await.unwrap();
+    // First request: governor passes it through (handler may return any status)
+    let r1 = app.clone()
+        .oneshot(Request::builder()
+            .method(Method::POST).uri("/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .body(Body::from("{}")).unwrap())
+        .await.unwrap();
     assert_ne!(r1.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // Second request: burst exhausted, governor returns 429 before reaching handler
-    let r2 = app.clone().oneshot(make_login_req()).await.unwrap();
+    let r2 = app.clone()
+        .oneshot(Request::builder()
+            .method(Method::POST).uri("/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+            .body(Body::from("{}")).unwrap())
+        .await.unwrap();
     assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 ```
 
-Same pattern for `register_rate_limited_returns_429` and `refresh_rate_limited_returns_429`.
-`tight_app` does not need a real database connection because the governor rejects before the
-handler (which would need the pool) is ever called for the second request. `PgPool::connect_lazy`
-is sufficient.
+Same pattern for `register_rate_limited_returns_429` (`/register`) and
+`refresh_rate_limited_returns_429` (`/refresh`).
+
+`tight_app` does not need a real database connection: the governor rejects r2 before the
+handler (which would need the pool) is ever reached. `PgPool::connect_lazy("postgres://unused")`
+is sufficient. r1 may return 500 or 422 from the handler — the assertion only checks it is not
+429, which a 500 satisfies.
 
 ---
 

@@ -140,7 +140,18 @@ sleep required.
 
 Because `GovernorLayer` holds the rate-limiter state behind `Arc`, cloning the `Router` shares the
 same token bucket. The two `.oneshot()` calls on clones of the same router instance see the same
-state:
+state.
+
+> **Implementation note:** Verify at implementation time that `Router::clone()` in axum 0.8 does
+> share the inner `Arc<GovernorConfig>` state rather than creating a fresh copy. If cloning were to
+> produce independent state, r2 would return 422 (not 429) and the assertion would fail loudly —
+> but it is better to confirm the behaviour is intentional than to rely on a silent assumption.
+
+Each request body is `{}` — an empty JSON object. All three request structs (`LoginRequest`,
+`RegisterRequest`, `RefreshRequest`) have required string fields with no defaults. Axum's
+`Json<T>` extractor rejects `{}` with 422 *before* the handler body runs, so no database
+connection is reached for r1 either. `PgPool::connect_lazy("postgres://unused")` is sufficient
+for the entire test.
 
 ```rust
 #[tokio::test]
@@ -148,7 +159,8 @@ async fn login_rate_limited_returns_429() {
     let pool = PgPool::connect_lazy("postgres://unused").unwrap();
     let app = tight_app(pool);
 
-    // First request: governor passes it through (handler may return any status)
+    // Governor passes r1 through; extractor rejects {} (missing required fields) → 422.
+    // This confirms the governor did not block the request.
     let r1 = app.clone()
         .oneshot(Request::builder()
             .method(Method::POST).uri("/login")
@@ -156,9 +168,9 @@ async fn login_rate_limited_returns_429() {
             .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
             .body(Body::from("{}")).unwrap())
         .await.unwrap();
-    assert_ne!(r1.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(r1.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
-    // Second request: burst exhausted, governor returns 429 before reaching handler
+    // Burst exhausted; governor intercepts r2 before extractors run → 429.
     let r2 = app.clone()
         .oneshot(Request::builder()
             .method(Method::POST).uri("/login")
@@ -173,10 +185,20 @@ async fn login_rate_limited_returns_429() {
 Same pattern for `register_rate_limited_returns_429` (`/register`) and
 `refresh_rate_limited_returns_429` (`/refresh`).
 
-`tight_app` does not need a real database connection: the governor rejects r2 before the
-handler (which would need the pool) is ever reached. `PgPool::connect_lazy("postgres://unused")`
-is sufficient. r1 may return 500 or 422 from the handler — the assertion only checks it is not
-429, which a 500 satisfies.
+---
+
+## Acceptance Criteria
+
+Phase 5 is done when all of the following are true:
+
+1. `cargo test` passes — all 151 existing tests green, plus 3 new 429 tests = **154 total**.
+2. `cargo clippy` is clean (no new warnings).
+3. `GET /health` returns 200 — unaffected by auth rate limiting.
+4. `POST /auth/login` returns 429 after 10 requests from the same IP within one minute.
+5. `POST /auth/register` returns 429 after 5 requests from the same IP within one minute.
+6. `POST /auth/refresh` returns 429 after 30 requests from the same IP within one minute.
+7. All existing auth tests (`register_success`, `login_success_returns_tokens`, etc.) continue to
+   pass — each creates a fresh app instance with empty rate-limit state, so none trigger 429.
 
 ---
 

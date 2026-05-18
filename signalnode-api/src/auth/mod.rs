@@ -182,6 +182,9 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         // where failed_count is the pre-update stored value).
         // The 10th attempt returns a normal wrong-password 401 after setting
         // locked_until; the 11th attempt hits the lockout check above.
+        // NOTE: failed_count only resets on successful login (DELETE path below).
+        // After a lockout expires, a wrong-password attempt immediately re-locks
+        // the account (count is still ≥10). Intentional per Phase 6 spec.
         let upsert = sqlx::query(
             "INSERT INTO login_attempts (user_id, failed_count, last_failed_at) \
              VALUES ($1, 1, NOW()) \

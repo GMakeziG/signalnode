@@ -180,15 +180,79 @@ async fn refresh(
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    match encode_access_token(&claims.sub, &state.jwt_secret) {
-        Ok(access_token) => {
-            Json(serde_json::json!({ "access_token": access_token })).into_response()
+    let jti: Uuid = match claims.jti.as_deref().and_then(|s| s.parse().ok()) {
+        Some(id) => id,
+        None => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let user_id: Uuid = match claims.sub.parse() {
+        Ok(id) => id,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to begin refresh transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+
+    // Atomically consume the old jti — if it was already used (deleted), this returns 0 rows.
+    let deleted = sqlx::query("DELETE FROM refresh_tokens WHERE jti = $1")
+        .bind(jti)
+        .execute(&mut *tx)
+        .await;
+
+    match deleted {
+        Ok(r) if r.rows_affected() == 0 => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(e) => {
+            tracing::error!(error = ?e, "database error consuming refresh token jti");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Ok(_) => {}
+    }
+
+    let (new_refresh_token, new_jti, new_expires_at) =
+        match token::encode_refresh_token(&claims.sub, &state.jwt_secret) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = ?e, "refresh token encoding failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO refresh_tokens (jti, user_id, expires_at) VALUES ($1, $2, $3)",
+    )
+    .bind(new_jti)
+    .bind(user_id)
+    .bind(new_expires_at)
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to persist new refresh token");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!(error = ?e, "failed to commit refresh transaction");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let access_token = match token::encode_access_token(&claims.sub, &state.jwt_secret) {
+        Ok(t) => t,
         Err(e) => {
             tracing::error!(error = ?e, "access token encoding failed during refresh");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
+    };
+
+    Json(AuthResponse {
+        access_token,
+        refresh_token: new_refresh_token,
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -393,6 +457,80 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn refresh_returns_new_token_pair(pool: PgPool) {
+        let p2 = pool.clone();
+        let p3 = pool.clone();
+        post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "rotate@example.com", "password": "password123"}),
+        )
+        .await;
+        let login_res = post_json(
+            p2,
+            "/auth/login",
+            json!({"email": "rotate@example.com", "password": "password123"}),
+        )
+        .await;
+        let body = axum::body::to_bytes(login_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tokens: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let refresh_token = tokens["refresh_token"].as_str().unwrap().to_string();
+
+        let res = post_json(p3, "/auth/refresh", json!({"refresh_token": refresh_token})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["access_token"].is_string());
+        assert!(json["refresh_token"].is_string());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn refresh_token_is_single_use(pool: PgPool) {
+        let p2 = pool.clone();
+        let p3 = pool.clone();
+        let p4 = pool.clone();
+        post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "replay@example.com", "password": "password123"}),
+        )
+        .await;
+        let login_res = post_json(
+            p2,
+            "/auth/login",
+            json!({"email": "replay@example.com", "password": "password123"}),
+        )
+        .await;
+        let body = axum::body::to_bytes(login_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tokens: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let original_refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+        // First use succeeds
+        let res1 = post_json(
+            p3,
+            "/auth/refresh",
+            json!({"refresh_token": original_refresh}),
+        )
+        .await;
+        assert_eq!(res1.status(), StatusCode::OK);
+
+        // Replay with the same token is rejected
+        let res2 = post_json(
+            p4,
+            "/auth/refresh",
+            json!({"refresh_token": original_refresh}),
+        )
+        .await;
+        assert_eq!(res2.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test(migrations = "../migrations")]

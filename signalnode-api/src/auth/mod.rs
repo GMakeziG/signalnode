@@ -260,12 +260,28 @@ async fn refresh(
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{header, Method, Request, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
     use serde_json::json;
     use sqlx::PgPool;
+    use std::net::SocketAddr;
     use tower::ServiceExt;
 
     use crate::app;
+
+    fn tight_app(pool: PgPool) -> Router {
+        let state = crate::AppState {
+            pool,
+            jwt_secret: TEST_JWT_SECRET.to_string(),
+        };
+        Router::new()
+            .route("/login", post(super::login))
+            .route("/register", post(super::register))
+            .route("/refresh", post(super::refresh))
+            .with_state(state)
+    }
 
     const TEST_JWT_SECRET: &str = "test-secret-at-least-32-chars-long!";
 
@@ -561,5 +577,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn login_rate_limited_returns_429() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let app = tight_app(pool);
+
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn register_rate_limited_returns_429() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let app = tight_app(pool);
+
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn refresh_rate_limited_returns_429() {
+        let pool = PgPool::connect_lazy("postgres://unused").unwrap();
+        let app = tight_app(pool);
+
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/refresh")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/refresh")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

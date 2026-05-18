@@ -85,6 +85,9 @@ pub fn decode_refresh_token(
     if data.claims.kind != KIND_REFRESH {
         return Err(ErrorKind::InvalidToken.into());
     }
+    if data.claims.jti.is_none() {
+        return Err(ErrorKind::InvalidToken.into());
+    }
     Ok(data.claims)
 }
 
@@ -133,7 +136,9 @@ mod tests {
         let (token, _jti, _exp) = encode_refresh_token("user-123", SECRET).unwrap();
         let claims = decode_refresh_token(&token, SECRET).unwrap();
         assert!(claims.jti.is_some());
-        assert!(!claims.jti.as_deref().unwrap_or("").is_empty());
+        let jti_str = claims.jti.unwrap();
+        assert!(!jti_str.is_empty());
+        assert!(jti_str.parse::<uuid::Uuid>().is_ok(), "jti must be a valid UUID");
     }
 
     #[test]

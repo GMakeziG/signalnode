@@ -22,12 +22,14 @@ HTTP status codes are unchanged. No new dependencies. No schema changes.
 A small private helper avoids duplicating `Json(json!({...}))` construction across five modules. Added to `lib.rs` (already the home of `AppState`):
 
 ```rust
-pub fn error_body(code: &str, message: &str) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({"code": code, "message": message}))
+#[derive(Serialize)]
+pub struct ErrorBody {
+    code: &'static str,
+    message: Cow<'static, str>,
 }
 ```
 
-Each module's `IntoResponse` impl calls `error_body(...)` instead of inlining `Json(json!(...))`. This is the only shared piece — enum definitions stay local.
+Json(ErrorBody { ... })
 
 ## Per-Module Error Enums
 
@@ -135,7 +137,7 @@ Each test asserts: correct HTTP status + body contains `"code"` key with expecte
 
 | File | Change |
 |---|---|
-| `src/lib.rs` | Add `pub fn error_body(code, message) -> Json<Value>` |
+| `src/lib.rs` | Add `pub struct ErrorBody` with `Cow<'static, str>` fields + `Serialize` |
 | `src/workspace/error.rs` | New — `WorkspaceError` enum + `IntoResponse` |
 | `src/workspace/mod.rs` | `mod error; use error::WorkspaceError;` — replace bare StatusCode returns; add 1 body test |
 | `src/monitor/error.rs` | New — `MonitorError` enum + `IntoResponse` |

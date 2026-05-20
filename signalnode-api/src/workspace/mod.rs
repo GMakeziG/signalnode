@@ -11,6 +11,9 @@ use uuid::Uuid;
 
 use crate::{middleware::CurrentUser, AppState};
 
+mod error;
+use error::WorkspaceError;
+
 #[derive(Serialize, sqlx::FromRow)]
 struct Workspace {
     id: Uuid,
@@ -50,35 +53,43 @@ async fn create_workspace(
     current_user: CurrentUser,
     Json(body): Json<CreateWorkspaceRequest>,
 ) -> impl IntoResponse {
-    if body.name.is_empty() || !is_valid_slug(&body.slug) {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    if body.name.is_empty() {
+        return WorkspaceError::InvalidInput("Name must not be empty".into()).into_response();
+    }
+    if !is_valid_slug(&body.slug) {
+        return WorkspaceError::InvalidInput(
+            "Slug must be lowercase alphanumeric, optionally separated by hyphens".into(),
+        )
+        .into_response();
     }
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
             tracing::error!(error = ?e, "failed to begin transaction");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return WorkspaceError::Internal.into_response();
         }
     };
 
     let workspace_id = Uuid::new_v4();
 
-    match sqlx::query("INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)")
-        .bind(workspace_id)
-        .bind(&body.name)
-        .bind(&body.slug)
-        .bind(current_user.id)
-        .execute(&mut *tx)
-        .await
+    match sqlx::query(
+        "INSERT INTO workspaces (id, name, slug, owner_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(workspace_id)
+    .bind(&body.name)
+    .bind(&body.slug)
+    .bind(current_user.id)
+    .execute(&mut *tx)
+    .await
     {
         Ok(_) => {}
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return StatusCode::CONFLICT.into_response();
+            return WorkspaceError::SlugTaken.into_response();
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to insert workspace");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return WorkspaceError::Internal.into_response();
         }
     }
 
@@ -91,7 +102,7 @@ async fn create_workspace(
     .await
     {
         tracing::error!(error = ?e, "failed to insert owner membership");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return WorkspaceError::Internal.into_response();
     }
 
     let workspace = match sqlx::query_as::<_, Workspace>(
@@ -104,13 +115,13 @@ async fn create_workspace(
         Ok(w) => w,
         Err(e) => {
             tracing::error!(error = ?e, "failed to fetch created workspace");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return WorkspaceError::Internal.into_response();
         }
     };
 
     if let Err(e) = tx.commit().await {
         tracing::error!(error = ?e, "failed to commit transaction");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return WorkspaceError::Internal.into_response();
     }
 
     (StatusCode::CREATED, Json(workspace)).into_response()
@@ -134,7 +145,7 @@ async fn list_workspaces(
         Ok(ws) => Json(ws).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to list workspaces");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            WorkspaceError::Internal.into_response()
         }
     }
 }
@@ -150,8 +161,6 @@ mod tests {
 
     use crate::app;
     use crate::test_helpers::{authed, create_test_user, TEST_JWT_SECRET};
-
-    // --- create_workspace tests ---
 
     #[sqlx::test(migrations = "../migrations")]
     async fn create_workspace_success(pool: PgPool) {
@@ -272,8 +281,6 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // --- list_workspaces tests ---
-
     #[sqlx::test(migrations = "../migrations")]
     async fn list_workspaces_returns_own(pool: PgPool) {
         let uid1 = create_test_user(&pool).await;
@@ -331,5 +338,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_workspace_duplicate_slug_returns_structured_error(pool: PgPool) {
+        let uid1 = create_test_user(&pool).await;
+        authed(
+            pool.clone(),
+            Method::POST,
+            "/api/workspaces",
+            uid1,
+            Some(json!({"name": "First", "slug": "same-slug"})),
+        )
+        .await;
+        let uid2 = create_test_user(&pool).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            "/api/workspaces",
+            uid2,
+            Some(json!({"name": "Second", "slug": "same-slug"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "slug_taken");
     }
 }

@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 use crate::{middleware::CurrentUser, AppState};
 
+mod error;
+use error::MonitorError;
+
 #[derive(Serialize, sqlx::FromRow)]
 struct Monitor {
     id: Uuid,
@@ -67,7 +70,7 @@ async fn check_membership(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), MonitorError> {
     match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
     )
@@ -85,22 +88,26 @@ async fn check_membership(
             .fetch_one(pool)
             .await
             {
-                Ok(true) => Err(StatusCode::FORBIDDEN),
-                Ok(false) => Err(StatusCode::NOT_FOUND),
+                Ok(true) => Err(MonitorError::Forbidden),
+                Ok(false) => Err(MonitorError::NotFound),
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to check workspace existence");
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                    Err(MonitorError::Internal)
                 }
             }
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check workspace membership");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(MonitorError::Internal)
         }
     }
 }
 
-async fn check_owner(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> Result<(), StatusCode> {
+async fn check_owner(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), MonitorError> {
     match sqlx::query_scalar::<_, String>(
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
     )
@@ -110,7 +117,7 @@ async fn check_owner(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> Result
     .await
     {
         Ok(Some(role)) if role == "owner" => Ok(()),
-        Ok(Some(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(Some(_)) => Err(MonitorError::Forbidden),
         Ok(None) => match sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
         )
@@ -118,16 +125,16 @@ async fn check_owner(pool: &PgPool, workspace_id: Uuid, user_id: Uuid) -> Result
         .fetch_one(pool)
         .await
         {
-            Ok(true) => Err(StatusCode::FORBIDDEN),
-            Ok(false) => Err(StatusCode::NOT_FOUND),
+            Ok(true) => Err(MonitorError::Forbidden),
+            Ok(false) => Err(MonitorError::NotFound),
             Err(e) => {
                 tracing::error!(error = ?e, "failed to check workspace existence");
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
+                Err(MonitorError::Internal)
             }
         },
         Err(e) => {
             tracing::error!(error = ?e, "failed to check workspace owner");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(MonitorError::Internal)
         }
     }
 }
@@ -138,8 +145,8 @@ async fn create_monitor(
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<CreateMonitorRequest>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     let failure_threshold = body.failure_threshold.unwrap_or(1);
@@ -151,7 +158,10 @@ async fn create_monitor(
         || failure_threshold < 1
         || recovery_threshold < 1
     {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return MonitorError::InvalidInput(
+            "Name and URL must not be empty; interval, failure and recovery thresholds must be >= 1".into(),
+        )
+        .into_response();
     }
 
     match sqlx::query_as::<_, Monitor>(
@@ -172,7 +182,7 @@ async fn create_monitor(
         Ok(monitor) => (StatusCode::CREATED, Json(monitor)).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to insert monitor");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            MonitorError::Internal.into_response()
         }
     }
 }
@@ -183,8 +193,8 @@ async fn list_monitors(
     Path(workspace_id): Path<Uuid>,
     Query(params): Query<ListMonitorsQuery>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     let sql = if params.include_archived.unwrap_or(false) {
@@ -205,7 +215,7 @@ async fn list_monitors(
         Ok(monitors) => Json(monitors).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to list monitors");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            MonitorError::Internal.into_response()
         }
     }
 }
@@ -215,8 +225,8 @@ async fn get_monitor(
     current_user: CurrentUser,
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     match sqlx::query_as::<_, Monitor>(
@@ -230,10 +240,10 @@ async fn get_monitor(
     .await
     {
         Ok(Some(monitor)) => Json(monitor).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => MonitorError::NotFound.into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to fetch monitor");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            MonitorError::Internal.into_response()
         }
     }
 }
@@ -244,8 +254,8 @@ async fn patch_monitor(
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<PatchMonitorRequest>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     if body.name.is_none()
@@ -255,7 +265,8 @@ async fn patch_monitor(
         && body.failure_threshold.is_none()
         && body.recovery_threshold.is_none()
     {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return MonitorError::InvalidInput("At least one field must be provided".into())
+            .into_response();
     }
 
     if matches!(&body.name, Some(n) if n.is_empty())
@@ -264,12 +275,18 @@ async fn patch_monitor(
         || matches!(body.failure_threshold, Some(f) if f < 1)
         || matches!(body.recovery_threshold, Some(r) if r < 1)
     {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return MonitorError::InvalidInput(
+            "Name and URL must not be empty; interval, failure and recovery thresholds must be >= 1".into(),
+        )
+        .into_response();
     }
 
     if let Some(ref s) = body.status {
         if s != "active" && s != "paused" {
-            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            return MonitorError::InvalidInput(
+                "Status must be 'active' or 'paused'".into(),
+            )
+            .into_response();
         }
     }
 
@@ -282,15 +299,16 @@ async fn patch_monitor(
     .await
     {
         Ok(Some(s)) => s,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return MonitorError::NotFound.into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to fetch monitor status for patch");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return MonitorError::Internal.into_response();
         }
     };
 
     if current_status == "archived" {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return MonitorError::InvalidInput("Archived monitors cannot be modified".into())
+            .into_response();
     }
 
     match sqlx::query_as::<_, Monitor>(
@@ -318,10 +336,10 @@ async fn patch_monitor(
     .await
     {
         Ok(Some(monitor)) => Json(monitor).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => MonitorError::NotFound.into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to update monitor");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            MonitorError::Internal.into_response()
         }
     }
 }
@@ -331,8 +349,8 @@ async fn delete_monitor(
     current_user: CurrentUser,
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_owner(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_owner(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     match sqlx::query(
@@ -343,11 +361,11 @@ async fn delete_monitor(
     .execute(&state.pool)
     .await
     {
-        Ok(result) if result.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
+        Ok(result) if result.rows_affected() == 0 => MonitorError::NotFound.into_response(),
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to archive monitor");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            MonitorError::Internal.into_response()
         }
     }
 }
@@ -1200,5 +1218,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_monitor_empty_name_returns_structured_error(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({"name": "", "url": "https://example.com", "interval_secs": 60})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "invalid_input");
     }
 }

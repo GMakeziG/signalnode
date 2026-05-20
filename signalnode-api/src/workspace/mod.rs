@@ -84,7 +84,10 @@ async fn create_workspace(
     .await
     {
         Ok(_) => {}
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+        Err(sqlx::Error::Database(e))
+            if e.is_unique_violation()
+                && e.constraint() == Some("workspaces_slug_key") =>
+        {
             return WorkspaceError::SlugTaken.into_response();
         }
         Err(e) => {

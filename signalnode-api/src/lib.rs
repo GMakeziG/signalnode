@@ -10,7 +10,9 @@ pub mod workspace;
 pub mod test_helpers;
 
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use middleware::CurrentUser;
 use serde::Serialize;
+use sqlx::PgPool;
 use std::borrow::Cow;
 
 #[derive(Serialize)]
@@ -18,8 +20,6 @@ pub struct ErrorBody {
     pub code: &'static str,
     pub message: Cow<'static, str>,
 }
-use middleware::CurrentUser;
-use sqlx::PgPool;
 
 #[derive(Clone)]
 pub struct AppState {

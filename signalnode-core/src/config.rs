@@ -5,6 +5,7 @@ pub struct Config {
     pub smtp: Option<SmtpConfig>,
     pub poll_interval_secs: u64,
     pub checker_poll_interval_secs: u64,
+    pub purge_interval_secs: u64,
 }
 
 impl Config {
@@ -12,7 +13,6 @@ impl Config {
         Self::from_provider(|k| std::env::var(k).ok())
     }
 
-    // Separated so tests can inject vars without touching the process environment.
     fn from_provider(get: impl Fn(&str) -> Option<String>) -> Self {
         let database_url = get("DATABASE_URL").expect("DATABASE_URL must be set");
 
@@ -34,7 +34,11 @@ impl Config {
             .map(|v| v.parse::<u64>().expect("CHECKER_POLL_INTERVAL_SECS must be a positive integer"))
             .unwrap_or(30);
 
-        Config { database_url, smtp, poll_interval_secs, checker_poll_interval_secs }
+        let purge_interval_secs = get("TOKEN_PURGE_INTERVAL_SECS")
+            .map(|v| v.parse::<u64>().expect("TOKEN_PURGE_INTERVAL_SECS must be a positive integer"))
+            .unwrap_or(3600);
+
+        Config { database_url, smtp, poll_interval_secs, checker_poll_interval_secs, purge_interval_secs }
     }
 }
 
@@ -86,6 +90,21 @@ mod tests {
             ("CHECKER_POLL_INTERVAL_SECS", "60"),
         ]));
         assert_eq!(cfg.checker_poll_interval_secs, 60);
+    }
+
+    #[test]
+    fn from_env_uses_purge_interval_default() {
+        let cfg = Config::from_provider(vars(&[("DATABASE_URL", "postgres://unused")]));
+        assert_eq!(cfg.purge_interval_secs, 3600);
+    }
+
+    #[test]
+    fn from_env_parses_purge_interval() {
+        let cfg = Config::from_provider(vars(&[
+            ("DATABASE_URL", "postgres://unused"),
+            ("TOKEN_PURGE_INTERVAL_SECS", "7200"),
+        ]));
+        assert_eq!(cfg.purge_interval_secs, 7200);
     }
 
     #[test]

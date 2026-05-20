@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 use crate::{middleware::CurrentUser, AppState};
 
+mod error;
+use error::NotificationChannelError;
+
 #[derive(Serialize, sqlx::FromRow)]
 struct NotificationChannel {
     id: Uuid,
@@ -43,7 +46,7 @@ async fn check_membership(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), NotificationChannelError> {
     match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
     )
@@ -61,17 +64,17 @@ async fn check_membership(
             .fetch_one(pool)
             .await
             {
-                Ok(true) => Err(StatusCode::FORBIDDEN),
-                Ok(false) => Err(StatusCode::NOT_FOUND),
+                Ok(true) => Err(NotificationChannelError::Forbidden),
+                Ok(false) => Err(NotificationChannelError::NotFound),
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to check workspace existence");
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                    Err(NotificationChannelError::Internal)
                 }
             }
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check workspace membership");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(NotificationChannelError::Internal)
         }
     }
 }
@@ -80,7 +83,7 @@ async fn check_owner(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), NotificationChannelError> {
     match sqlx::query_scalar::<_, String>(
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
     )
@@ -90,7 +93,7 @@ async fn check_owner(
     .await
     {
         Ok(Some(role)) if role == "owner" => Ok(()),
-        Ok(Some(_)) => Err(StatusCode::FORBIDDEN),
+        Ok(Some(_)) => Err(NotificationChannelError::Forbidden),
         Ok(None) => match sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
         )
@@ -98,16 +101,16 @@ async fn check_owner(
         .fetch_one(pool)
         .await
         {
-            Ok(true) => Err(StatusCode::FORBIDDEN),
-            Ok(false) => Err(StatusCode::NOT_FOUND),
+            Ok(true) => Err(NotificationChannelError::Forbidden),
+            Ok(false) => Err(NotificationChannelError::NotFound),
             Err(e) => {
                 tracing::error!(error = ?e, "failed to check workspace existence");
-                Err(StatusCode::INTERNAL_SERVER_ERROR)
+                Err(NotificationChannelError::Internal)
             }
         },
         Err(e) => {
             tracing::error!(error = ?e, "failed to check workspace owner");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(NotificationChannelError::Internal)
         }
     }
 }
@@ -118,15 +121,19 @@ async fn create_channel(
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<CreateChannelRequest>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_owner(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_owner(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     if !matches!(body.kind.as_str(), "email" | "webhook") {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return NotificationChannelError::InvalidInput(
+            "Kind must be 'email' or 'webhook'".into(),
+        )
+        .into_response();
     }
     if body.target.trim().is_empty() {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return NotificationChannelError::InvalidInput("Target must not be empty".into())
+            .into_response();
     }
 
     match sqlx::query_as::<_, NotificationChannel>(
@@ -143,7 +150,7 @@ async fn create_channel(
         Ok(channel) => (StatusCode::CREATED, Json(channel)).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to create notification channel");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            NotificationChannelError::Internal.into_response()
         }
     }
 }
@@ -153,8 +160,8 @@ async fn list_channels(
     current_user: CurrentUser,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     match sqlx::query_as::<_, NotificationChannel>(
@@ -170,7 +177,7 @@ async fn list_channels(
         Ok(channels) => Json(channels).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to list notification channels");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            NotificationChannelError::Internal.into_response()
         }
     }
 }
@@ -180,8 +187,8 @@ async fn delete_channel(
     current_user: CurrentUser,
     Path((workspace_id, channel_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_owner(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_owner(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     match sqlx::query(
@@ -192,11 +199,13 @@ async fn delete_channel(
     .execute(&state.pool)
     .await
     {
-        Ok(result) if result.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
+        Ok(result) if result.rows_affected() == 0 => {
+            NotificationChannelError::NotFound.into_response()
+        }
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to delete notification channel");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            NotificationChannelError::Internal.into_response()
         }
     }
 }
@@ -605,5 +614,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_channel_empty_target_returns_structured_error(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/notification-channels"),
+            uid,
+            Some(json!({"kind": "email", "target": ""})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "invalid_input");
     }
 }

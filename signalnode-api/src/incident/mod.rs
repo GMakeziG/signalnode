@@ -1,6 +1,5 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -11,6 +10,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{middleware::CurrentUser, AppState};
+
+mod error;
+use error::IncidentError;
 
 #[derive(Serialize, sqlx::FromRow)]
 struct Incident {
@@ -30,7 +32,7 @@ async fn check_membership(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), IncidentError> {
     match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
     )
@@ -48,17 +50,17 @@ async fn check_membership(
             .fetch_one(pool)
             .await
             {
-                Ok(true) => Err(StatusCode::FORBIDDEN),
-                Ok(false) => Err(StatusCode::NOT_FOUND),
+                Ok(true) => Err(IncidentError::Forbidden),
+                Ok(false) => Err(IncidentError::NotFound),
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to check workspace existence");
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                    Err(IncidentError::Internal)
                 }
             }
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check workspace membership");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(IncidentError::Internal)
         }
     }
 }
@@ -68,8 +70,8 @@ async fn list_open_incidents(
     current_user: CurrentUser,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
 
     match sqlx::query_as::<_, Incident>(
@@ -87,7 +89,7 @@ async fn list_open_incidents(
         Ok(incidents) => Json(incidents).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to list open incidents");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            IncidentError::Internal.into_response()
         }
     }
 }
@@ -281,6 +283,27 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn list_incidents_forbidden_returns_structured_error(pool: PgPool) {
+        let uid1 = create_test_user(&pool).await;
+        let uid2 = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid1).await;
+        let res = authed(
+            pool,
+            Method::GET,
+            &format!("/api/workspaces/{wid}/incidents"),
+            uid2,
+            None,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "forbidden");
     }
 
     #[tokio::test]

@@ -87,6 +87,8 @@ Two integration tests in `purger.rs` under `#[cfg(test)]`, hitting the real DB:
 
 Tests clean up after themselves. `#[serial]` added only if DB races surface during the red phase.
 
+**Baseline:** 160 tests (131 signalnode-api + 29 signalnode-core). Phase 7 target: **162**.
+
 ---
 
 ## Out of Scope

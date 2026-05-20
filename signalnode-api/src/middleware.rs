@@ -1,12 +1,12 @@
 use axum::{
     extract::{FromRequestParts, Request, State},
-    http::{request::Parts, StatusCode},
+    http::request::Parts,
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use uuid::Uuid;
 
-use crate::{auth::token::decode_access_token, AppState};
+use crate::{auth::{error::AuthError, token::decode_access_token}, AppState};
 
 #[derive(Clone)]
 pub struct CurrentUser {
@@ -17,14 +17,14 @@ impl<S> FromRequestParts<S> for CurrentUser
 where
     S: Send + Sync,
 {
-    type Rejection = StatusCode;
+    type Rejection = AuthError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         parts
             .extensions
             .get::<CurrentUser>()
             .cloned()
-            .ok_or(StatusCode::UNAUTHORIZED)
+            .ok_or(AuthError::InvalidToken)
     }
 }
 
@@ -41,19 +41,19 @@ pub async fn auth_middleware(
 
     let token = match token {
         Some(t) => t.to_owned(),
-        None => return StatusCode::UNAUTHORIZED.into_response(),
+        None => return AuthError::InvalidToken.into_response(),
     };
 
     let claims = match decode_access_token(&token, &state.jwt_secret) {
         Ok(c) => c,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return AuthError::InvalidToken.into_response(),
     };
 
     let user_id = match Uuid::parse_str(&claims.sub) {
         Ok(id) => id,
         Err(e) => {
             tracing::error!(error = ?e, "invalid UUID in token sub claim");
-            return StatusCode::UNAUTHORIZED.into_response();
+            return AuthError::InvalidToken.into_response();
         }
     };
 

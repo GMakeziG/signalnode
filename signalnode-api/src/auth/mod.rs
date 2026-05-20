@@ -1,3 +1,4 @@
+pub mod error;
 pub mod password;
 pub mod token;
 
@@ -9,6 +10,7 @@ use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use uuid::Uuid;
 
 use crate::AppState;
+use error::AuthError;
 use password::{hash_password, verify_password};
 use token::{encode_access_token, encode_refresh_token};
 
@@ -84,7 +86,7 @@ async fn register(
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
     if !is_valid_email(&body.email) || body.password.len() < 8 {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return AuthError::InvalidInput("Email and password are required".into()).into_response();
     }
 
     let password = body.password.clone();
@@ -92,11 +94,11 @@ async fn register(
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
             tracing::error!(error = ?e, "password hashing failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
         Err(e) => {
             tracing::error!(error = ?e, "spawn_blocking panicked during hash");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
     };
 
@@ -110,11 +112,11 @@ async fn register(
     match result {
         Ok(_) => StatusCode::CREATED.into_response(),
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            StatusCode::CONFLICT.into_response()
+            AuthError::EmailTaken.into_response()
         }
         Err(e) => {
             tracing::error!(error = ?e, "database error during register");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            AuthError::Internal.into_response()
         }
     }
 }
@@ -131,11 +133,11 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         Ok(None) => {
             // Dummy verify to equalise timing with the found-user path
             let _ = tokio::task::spawn_blocking(|| verify_password("x", dummy_hash())).await;
-            return StatusCode::UNAUTHORIZED.into_response();
+            return AuthError::InvalidCredentials.into_response();
         }
         Err(e) => {
             tracing::error!(error = ?e, "database error during login");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
     };
 
@@ -153,11 +155,11 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     .await;
 
     match is_locked {
-        Ok(true) => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(true) => return AuthError::InvalidCredentials.into_response(),
         Ok(false) => {}
         Err(e) => {
             tracing::error!(error = ?e, "database error checking account lockout");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
     }
 
@@ -168,11 +170,11 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::error!(error = ?e, "password verification error");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
         Err(e) => {
             tracing::error!(error = ?e, "spawn_blocking panicked during verify");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
     };
 
@@ -203,9 +205,9 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
 
         if let Err(e) = upsert {
             tracing::error!(error = ?e, "database error recording failed login attempt");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
-        return StatusCode::UNAUTHORIZED.into_response();
+        return AuthError::InvalidCredentials.into_response();
     }
 
     // Successful login: remove all failure state for this account.
@@ -215,7 +217,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         .await
     {
         tracing::error!(error = ?e, "database error clearing login attempts on success");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return AuthError::Internal.into_response();
     }
 
     let uid = user_id.to_string();
@@ -223,7 +225,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = ?e, "access token encoding failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
     };
     let (refresh_token, refresh_jti, refresh_expires_at) =
@@ -231,7 +233,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(error = ?e, "refresh token encoding failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return AuthError::Internal.into_response();
             }
         };
 
@@ -246,7 +248,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
 
     if let Err(e) = result {
         tracing::error!(error = ?e, "failed to persist refresh token");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return AuthError::Internal.into_response();
     }
 
     Json(AuthResponse {
@@ -262,24 +264,24 @@ async fn refresh(
 ) -> impl IntoResponse {
     let claims = match token::decode_refresh_token(&body.refresh_token, &state.jwt_secret) {
         Ok(c) => c,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return AuthError::InvalidToken.into_response(),
     };
 
     let jti: Uuid = match claims.jti.as_deref().and_then(|s| s.parse().ok()) {
         Some(id) => id,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
+        None => return AuthError::InvalidToken.into_response(),
     };
 
     let user_id: Uuid = match claims.sub.parse() {
         Ok(id) => id,
-        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => return AuthError::InvalidToken.into_response(),
     };
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
             tracing::error!(error = ?e, "failed to begin refresh transaction");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
     };
 
@@ -291,10 +293,10 @@ async fn refresh(
         .await;
 
     match deleted {
-        Ok(r) if r.rows_affected() == 0 => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(r) if r.rows_affected() == 0 => return AuthError::InvalidToken.into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "database error consuming refresh token jti");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
         Ok(_) => {}
     }
@@ -304,7 +306,7 @@ async fn refresh(
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(error = ?e, "refresh token encoding failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return AuthError::Internal.into_response();
             }
         };
 
@@ -318,19 +320,19 @@ async fn refresh(
     .await
     {
         tracing::error!(error = ?e, "failed to persist new refresh token");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return AuthError::Internal.into_response();
     }
 
     if let Err(e) = tx.commit().await {
         tracing::error!(error = ?e, "failed to commit refresh transaction");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return AuthError::Internal.into_response();
     }
 
     let access_token = match token::encode_access_token(&claims.sub, &state.jwt_secret) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = ?e, "access token encoding failed during refresh");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return AuthError::Internal.into_response();
         }
     };
 
@@ -1007,5 +1009,47 @@ mod tests {
         .unwrap();
 
         assert_eq!(row_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn login_wrong_password_returns_structured_error(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "struct@example.com", "password": "password123"}),
+        )
+        .await;
+        let res = post_json(
+            pool,
+            "/auth/login",
+            json!({"email": "struct@example.com", "password": "wrongpass1"}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "invalid_credentials");
+        assert_eq!(json["message"], "Invalid email or password");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn register_duplicate_email_returns_structured_error(pool: PgPool) {
+        post_json(
+            pool.clone(),
+            "/auth/register",
+            json!({"email": "duperr@example.com", "password": "password123"}),
+        )
+        .await;
+        let res = post_json(
+            pool,
+            "/auth/register",
+            json!({"email": "duperr@example.com", "password": "password456"}),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "email_taken");
+        assert_eq!(json["message"], "An account with that email already exists");
     }
 }

@@ -12,6 +12,9 @@ use uuid::Uuid;
 
 use crate::{middleware::CurrentUser, AppState};
 
+mod error;
+use error::CheckResultError;
+
 #[derive(Serialize, sqlx::FromRow)]
 struct CheckResult {
     id: Uuid,
@@ -40,7 +43,7 @@ async fn check_membership(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), CheckResultError> {
     match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
     )
@@ -58,17 +61,17 @@ async fn check_membership(
             .fetch_one(pool)
             .await
             {
-                Ok(true) => Err(StatusCode::FORBIDDEN),
-                Ok(false) => Err(StatusCode::NOT_FOUND),
+                Ok(true) => Err(CheckResultError::Forbidden),
+                Ok(false) => Err(CheckResultError::NotFound),
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to check workspace existence");
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                    Err(CheckResultError::Internal)
                 }
             }
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check workspace membership");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(CheckResultError::Internal)
         }
     }
 }
@@ -77,7 +80,7 @@ async fn resolve_monitor(
     pool: &PgPool,
     workspace_id: Uuid,
     monitor_id: Uuid,
-) -> Result<(), StatusCode> {
+) -> Result<(), CheckResultError> {
     match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM monitors WHERE id = $1 AND workspace_id = $2)",
     )
@@ -87,10 +90,10 @@ async fn resolve_monitor(
     .await
     {
         Ok(true) => Ok(()),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Ok(false) => Err(CheckResultError::NotFound),
         Err(e) => {
             tracing::error!(error = ?e, "failed to resolve monitor");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(CheckResultError::Internal)
         }
     }
 }
@@ -101,15 +104,18 @@ async fn create_check_result(
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<CreateCheckResultRequest>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
-    if let Err(status) = resolve_monitor(&state.pool, workspace_id, monitor_id).await {
-        return status.into_response();
+    if let Err(e) = resolve_monitor(&state.pool, workspace_id, monitor_id).await {
+        return e.into_response();
     }
 
     if !matches!(body.status.as_str(), "up" | "degraded" | "down") {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return CheckResultError::InvalidInput(
+            "Status must be 'up', 'degraded', or 'down'".into(),
+        )
+        .into_response();
     }
 
     let mut opened_incident_id: Option<Uuid> = None;
@@ -118,7 +124,7 @@ async fn create_check_result(
         Ok(tx) => tx,
         Err(e) => {
             tracing::error!(error = ?e, "failed to begin transaction");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return CheckResultError::Internal.into_response();
         }
     };
 
@@ -137,7 +143,7 @@ async fn create_check_result(
         Ok(cr) => cr,
         Err(e) => {
             tracing::error!(error = ?e, "failed to insert check_result");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return CheckResultError::Internal.into_response();
         }
     };
 
@@ -152,7 +158,7 @@ async fn create_check_result(
             Ok(row) => row,
             Err(e) => {
                 tracing::error!(error = ?e, "failed to fetch monitor for incident evaluation");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return CheckResultError::Internal.into_response();
             }
         };
 
@@ -167,7 +173,7 @@ async fn create_check_result(
             Ok(opt) => opt,
             Err(e) => {
                 tracing::error!(error = ?e, "failed to check for open incident");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                return CheckResultError::Internal.into_response();
             }
         };
 
@@ -184,7 +190,7 @@ async fn create_check_result(
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to fetch results for open evaluation");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    return CheckResultError::Internal.into_response();
                 }
             };
 
@@ -199,7 +205,7 @@ async fn create_check_result(
                     Ok(id) => id,
                     Err(e) => {
                         tracing::error!(error = ?e, "failed to open incident");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        return CheckResultError::Internal.into_response();
                     }
                 };
 
@@ -213,7 +219,7 @@ async fn create_check_result(
                     Ok(rows) => rows,
                     Err(e) => {
                         tracing::error!(error = ?e, "failed to fetch channels for outbox");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        return CheckResultError::Internal.into_response();
                     }
                 };
 
@@ -229,7 +235,7 @@ async fn create_check_result(
                     .await
                     {
                         tracing::error!(error = ?e, "failed to insert pending notification");
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        return CheckResultError::Internal.into_response();
                     }
                 }
 
@@ -248,7 +254,7 @@ async fn create_check_result(
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to fetch results for close evaluation");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    return CheckResultError::Internal.into_response();
                 }
             };
 
@@ -262,7 +268,7 @@ async fn create_check_result(
                 .await
                 {
                     tracing::error!(error = ?e, "failed to close incident");
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    return CheckResultError::Internal.into_response();
                 }
             }
         }
@@ -278,7 +284,7 @@ async fn create_check_result(
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to commit transaction");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            CheckResultError::Internal.into_response()
         }
     }
 }
@@ -288,11 +294,11 @@ async fn list_check_results(
     current_user: CurrentUser,
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(status) = check_membership(&state.pool, workspace_id, current_user.id).await {
-        return status.into_response();
+    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+        return e.into_response();
     }
-    if let Err(status) = resolve_monitor(&state.pool, workspace_id, monitor_id).await {
-        return status.into_response();
+    if let Err(e) = resolve_monitor(&state.pool, workspace_id, monitor_id).await {
+        return e.into_response();
     }
 
     match sqlx::query_as::<_, CheckResult>(
@@ -306,7 +312,7 @@ async fn list_check_results(
         Ok(results) => Json(results).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "failed to list check_results");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            CheckResultError::Internal.into_response()
         }
     }
 }
@@ -996,5 +1002,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_check_result_invalid_status_returns_structured_error(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let mid = create_test_monitor(&pool, wid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors/{mid}/check-results"),
+            uid,
+            Some(json!({"status": "broken"})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "invalid_input");
     }
 }

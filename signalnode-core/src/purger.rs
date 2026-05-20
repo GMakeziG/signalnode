@@ -2,7 +2,13 @@ use sqlx::PgPool;
 use std::time::Duration;
 
 pub async fn purge_once(pool: &PgPool) {
-    // stub — intentionally empty so tests fail
+    match sqlx::query("DELETE FROM refresh_tokens WHERE expires_at < NOW()")
+        .execute(pool)
+        .await
+    {
+        Ok(r) => tracing::info!(rows_deleted = r.rows_affected(), "purged expired refresh tokens"),
+        Err(e) => tracing::error!(error = ?e, "purge_once: failed to delete expired refresh tokens"),
+    }
 }
 
 pub async fn run_purger(pool: PgPool, interval: Duration) {

@@ -30,10 +30,12 @@ async fn main() {
 
     let worker_interval = Duration::from_secs(cfg.poll_interval_secs);
     let checker_interval = Duration::from_secs(cfg.checker_poll_interval_secs);
+    let purge_interval = Duration::from_secs(cfg.purge_interval_secs);
 
     info!(
         worker_interval_secs = cfg.poll_interval_secs,
         checker_interval_secs = cfg.checker_poll_interval_secs,
+        purge_interval_secs = cfg.purge_interval_secs,
         smtp_configured = cfg.smtp.is_some(),
         "signalnode-core starting workers"
     );
@@ -44,8 +46,10 @@ async fn main() {
         cfg.smtp,
         worker_interval,
     ));
-    let h2 = tokio::spawn(checker::run_checker(pool, client, checker_interval));
-    let (r1, r2) = tokio::join!(h1, h2);
+    let h2 = tokio::spawn(checker::run_checker(pool.clone(), client, checker_interval));
+    let h3 = tokio::spawn(purger::run_purger(pool, purge_interval));
+    let (r1, r2, r3) = tokio::join!(h1, h2, h3);
     r1.expect("delivery worker panicked");
     r2.expect("checker panicked");
+    r3.expect("purger panicked");
 }

@@ -126,115 +126,21 @@ async fn create_check_result(
         };
 
     if monitor_status == "active" {
-        let open_incident: Option<Uuid> = match sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL LIMIT 1",
+        opened_incident_id = match signalnode_shared::incident::evaluate_incident(
+            &mut tx,
+            monitor_id,
+            workspace_id,
+            failure_threshold,
+            recovery_threshold,
         )
-        .bind(monitor_id)
-        .fetch_optional(&mut *tx)
         .await
         {
-            Ok(opt) => opt,
+            Ok(id) => id,
             Err(e) => {
-                tracing::error!(error = ?e, "failed to check for open incident");
+                tracing::error!(error = ?e, "incident evaluation failed");
                 return CheckResultError::Internal.into_response();
             }
         };
-
-        if open_incident.is_none() {
-            let recent: Vec<String> = match sqlx::query_scalar::<_, String>(
-                "SELECT status FROM check_results \
-                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
-            )
-            .bind(monitor_id)
-            .bind(failure_threshold)
-            .fetch_all(&mut *tx)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::error!(error = ?e, "failed to fetch results for open evaluation");
-                    return CheckResultError::Internal.into_response();
-                }
-            };
-
-            if recent.len() == failure_threshold as usize && recent.iter().all(|s| s == "down") {
-                let incident_id = match sqlx::query_scalar::<_, Uuid>(
-                    "INSERT INTO incidents (monitor_id) VALUES ($1) RETURNING id",
-                )
-                .bind(monitor_id)
-                .fetch_one(&mut *tx)
-                .await
-                {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::error!(error = ?e, "failed to open incident");
-                        return CheckResultError::Internal.into_response();
-                    }
-                };
-
-                let channels = match sqlx::query_as::<_, (String, String)>(
-                    "SELECT kind, target FROM notification_channels WHERE workspace_id = $1",
-                )
-                .bind(workspace_id)
-                .fetch_all(&mut *tx)
-                .await
-                {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        tracing::error!(error = ?e, "failed to fetch channels for outbox");
-                        return CheckResultError::Internal.into_response();
-                    }
-                };
-
-                for (kind, target) in &channels {
-                    if let Err(e) = sqlx::query(
-                        "INSERT INTO pending_notifications (incident_id, channel_kind, target) \
-                         VALUES ($1, $2, $3)",
-                    )
-                    .bind(incident_id)
-                    .bind(kind)
-                    .bind(target)
-                    .execute(&mut *tx)
-                    .await
-                    {
-                        tracing::error!(error = ?e, "failed to insert pending notification");
-                        return CheckResultError::Internal.into_response();
-                    }
-                }
-
-                opened_incident_id = Some(incident_id);
-            }
-        } else {
-            let recent: Vec<String> = match sqlx::query_scalar::<_, String>(
-                "SELECT status FROM check_results \
-                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
-            )
-            .bind(monitor_id)
-            .bind(recovery_threshold)
-            .fetch_all(&mut *tx)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::error!(error = ?e, "failed to fetch results for close evaluation");
-                    return CheckResultError::Internal.into_response();
-                }
-            };
-
-            if recent.len() == recovery_threshold as usize && recent.iter().all(|s| s == "up") {
-                if let Err(e) = sqlx::query(
-                    "UPDATE incidents SET closed_at = NOW() \
-                     WHERE monitor_id = $1 AND closed_at IS NULL",
-                )
-                .bind(monitor_id)
-                .execute(&mut *tx)
-                .await
-                {
-                    tracing::error!(error = ?e, "failed to close incident");
-                    return CheckResultError::Internal.into_response();
-                }
-            }
-        }
     }
 
     match tx.commit().await {

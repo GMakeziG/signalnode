@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod authz;
 pub mod check_result;
 pub mod incident;
 pub mod middleware;

@@ -9,7 +9,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{middleware::CurrentUser, AppState};
+use crate::{authz, middleware::CurrentUser, AppState};
 
 mod error;
 use error::IncidentError;
@@ -28,49 +28,12 @@ pub fn router() -> Router<AppState> {
     )
 }
 
-async fn check_membership(
-    pool: &PgPool,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), IncidentError> {
-    match sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
-    )
-    .bind(workspace_id)
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            match sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
-            )
-            .bind(workspace_id)
-            .fetch_one(pool)
-            .await
-            {
-                Ok(true) => Err(IncidentError::Forbidden),
-                Ok(false) => Err(IncidentError::NotFound),
-                Err(e) => {
-                    tracing::error!(error = ?e, "failed to check workspace existence");
-                    Err(IncidentError::Internal)
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to check workspace membership");
-            Err(IncidentError::Internal)
-        }
-    }
-}
-
 async fn list_open_incidents(
     State(state): State<AppState>,
     current_user: CurrentUser,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+    if let Err(e) = authz::check_membership(&state.pool, workspace_id, current_user.id).await {
         return e.into_response();
     }
 

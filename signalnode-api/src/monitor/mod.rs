@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{middleware::CurrentUser, AppState};
+use crate::{authz, middleware::CurrentUser, AppState};
 
 mod error;
 use error::MonitorError;
@@ -66,86 +66,13 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-async fn check_membership(
-    pool: &PgPool,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), MonitorError> {
-    match sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
-    )
-    .bind(workspace_id)
-    .bind(user_id)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            match sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
-            )
-            .bind(workspace_id)
-            .fetch_one(pool)
-            .await
-            {
-                Ok(true) => Err(MonitorError::Forbidden),
-                Ok(false) => Err(MonitorError::NotFound),
-                Err(e) => {
-                    tracing::error!(error = ?e, "failed to check workspace existence");
-                    Err(MonitorError::Internal)
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to check workspace membership");
-            Err(MonitorError::Internal)
-        }
-    }
-}
-
-async fn check_owner(
-    pool: &PgPool,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), MonitorError> {
-    match sqlx::query_scalar::<_, String>(
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-    )
-    .bind(workspace_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(role)) if role == "owner" => Ok(()),
-        Ok(Some(_)) => Err(MonitorError::Forbidden),
-        Ok(None) => match sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)",
-        )
-        .bind(workspace_id)
-        .fetch_one(pool)
-        .await
-        {
-            Ok(true) => Err(MonitorError::Forbidden),
-            Ok(false) => Err(MonitorError::NotFound),
-            Err(e) => {
-                tracing::error!(error = ?e, "failed to check workspace existence");
-                Err(MonitorError::Internal)
-            }
-        },
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to check workspace owner");
-            Err(MonitorError::Internal)
-        }
-    }
-}
-
 async fn create_monitor(
     State(state): State<AppState>,
     current_user: CurrentUser,
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<CreateMonitorRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+    if let Err(e) = authz::check_membership(&state.pool, workspace_id, current_user.id).await {
         return e.into_response();
     }
 
@@ -193,7 +120,7 @@ async fn list_monitors(
     Path(workspace_id): Path<Uuid>,
     Query(params): Query<ListMonitorsQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+    if let Err(e) = authz::check_membership(&state.pool, workspace_id, current_user.id).await {
         return e.into_response();
     }
 
@@ -225,7 +152,7 @@ async fn get_monitor(
     current_user: CurrentUser,
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+    if let Err(e) = authz::check_membership(&state.pool, workspace_id, current_user.id).await {
         return e.into_response();
     }
 
@@ -254,7 +181,7 @@ async fn patch_monitor(
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
     Json(body): Json<PatchMonitorRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_membership(&state.pool, workspace_id, current_user.id).await {
+    if let Err(e) = authz::check_membership(&state.pool, workspace_id, current_user.id).await {
         return e.into_response();
     }
 
@@ -349,7 +276,7 @@ async fn delete_monitor(
     current_user: CurrentUser,
     Path((workspace_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_owner(&state.pool, workspace_id, current_user.id).await {
+    if let Err(e) = authz::check_owner(&state.pool, workspace_id, current_user.id).await {
         return e.into_response();
     }
 

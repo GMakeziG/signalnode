@@ -101,8 +101,6 @@ pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
     .await;
 
     // Phase 2: write results — one transaction per monitor for error isolation
-    // Bounded duplication: incident evaluation mirrors signalnode-api/src/check_result/mod.rs
-    // Extract to a shared crate in Phase 4.
     for outcome in outcomes {
         let mut tx = match pool.begin().await {
             Ok(tx) => tx,
@@ -127,129 +125,16 @@ pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
             continue;
         }
 
-        let open_incident = match sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL LIMIT 1",
+        if let Err(e) = signalnode_shared::incident::evaluate_incident(
+            &mut tx,
+            outcome.monitor.id,
+            outcome.monitor.workspace_id,
+            outcome.monitor.failure_threshold,
+            outcome.monitor.recovery_threshold,
         )
-        .bind(outcome.monitor.id)
-        .fetch_optional(&mut *tx)
         .await
         {
-            Ok(opt) => opt,
-            Err(e) => {
-                tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to check open incident");
-                if let Err(e) = tx.commit().await {
-                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit after incident check error");
-                }
-                continue;
-            }
-        };
-
-        if open_incident.is_none() {
-            let recent = match sqlx::query_scalar::<_, String>(
-                "SELECT status FROM check_results \
-                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
-            )
-            .bind(outcome.monitor.id)
-            .bind(outcome.monitor.failure_threshold)
-            .fetch_all(&mut *tx)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to fetch results for open evaluation");
-                    if let Err(e) = tx.commit().await {
-                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
-                    }
-                    continue;
-                }
-            };
-
-            if recent.len() == outcome.monitor.failure_threshold as usize
-                && recent.iter().all(|s| s == "down")
-            {
-                let incident_id = match sqlx::query_scalar::<_, Uuid>(
-                    "INSERT INTO incidents (monitor_id) VALUES ($1) RETURNING id",
-                )
-                .bind(outcome.monitor.id)
-                .fetch_one(&mut *tx)
-                .await
-                {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to open incident");
-                        if let Err(e) = tx.commit().await {
-                            tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
-                        }
-                        continue;
-                    }
-                };
-
-                let channels = match sqlx::query_as::<_, (String, String)>(
-                    "SELECT kind, target FROM notification_channels WHERE workspace_id = $1",
-                )
-                .bind(outcome.monitor.workspace_id)
-                .fetch_all(&mut *tx)
-                .await
-                {
-                    Ok(rows) => rows,
-                    Err(e) => {
-                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to fetch channels for fanout");
-                        if let Err(e) = tx.commit().await {
-                            tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
-                        }
-                        continue;
-                    }
-                };
-
-                for (kind, target) in &channels {
-                    if let Err(e) = sqlx::query(
-                        "INSERT INTO pending_notifications (incident_id, channel_kind, target) \
-                         VALUES ($1, $2, $3)",
-                    )
-                    .bind(incident_id)
-                    .bind(kind)
-                    .bind(target)
-                    .execute(&mut *tx)
-                    .await
-                    {
-                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to insert pending notification");
-                    }
-                }
-            }
-        } else {
-            let recent = match sqlx::query_scalar::<_, String>(
-                "SELECT status FROM check_results \
-                 WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT $2",
-            )
-            .bind(outcome.monitor.id)
-            .bind(outcome.monitor.recovery_threshold)
-            .fetch_all(&mut *tx)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to fetch results for close evaluation");
-                    if let Err(e) = tx.commit().await {
-                        tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to commit partial write");
-                    }
-                    continue;
-                }
-            };
-
-            if recent.len() == outcome.monitor.recovery_threshold as usize
-                && recent.iter().all(|s| s == "up")
-            {
-                if let Err(e) = sqlx::query(
-                    "UPDATE incidents SET closed_at = NOW() \
-                     WHERE monitor_id = $1 AND closed_at IS NULL",
-                )
-                .bind(outcome.monitor.id)
-                .execute(&mut *tx)
-                .await
-                {
-                    tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: failed to close incident");
-                }
-            }
+            tracing::error!(error = ?e, monitor_id = %outcome.monitor.id, "check_once: incident evaluation failed");
         }
 
         if let Err(e) = tx.commit().await {

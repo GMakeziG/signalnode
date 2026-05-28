@@ -20,12 +20,14 @@ struct Monitor {
     id: Uuid,
     workspace_id: Uuid,
     name: String,
-    url: String,
+    url: Option<String>,
     interval_secs: i32,
     status: String,
     failure_threshold: i32,
     recovery_threshold: i32,
     kind: String,
+    tcp_host: Option<String>,
+    tcp_port: Option<i32>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -33,10 +35,13 @@ struct Monitor {
 #[derive(Deserialize)]
 struct CreateMonitorRequest {
     name: String,
-    url: String,
+    kind: Option<String>,
+    url: Option<String>,
     interval_secs: i32,
     failure_threshold: Option<i32>,
     recovery_threshold: Option<i32>,
+    tcp_host: Option<String>,
+    tcp_port: Option<i32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -79,27 +84,59 @@ async fn create_monitor(
     let failure_threshold = body.failure_threshold.unwrap_or(1);
     let recovery_threshold = body.recovery_threshold.unwrap_or(1);
 
-    if body.name.is_empty()
-        || body.url.is_empty()
-        || body.interval_secs < 1
-        || failure_threshold < 1
-        || recovery_threshold < 1
-    {
+    if body.name.is_empty() || body.interval_secs < 1 || failure_threshold < 1 || recovery_threshold < 1 {
         return MonitorError::InvalidInput(
-            "Name and URL must not be empty; interval, failure and recovery thresholds must be >= 1".into(),
+            "Name must not be empty; interval, failure and recovery thresholds must be >= 1".into(),
         )
         .into_response();
     }
 
+    let kind = body.kind.as_deref().unwrap_or("uptime");
+    let (url_val, tcp_host_val, tcp_port_val) = match kind {
+        "uptime" => {
+            if body.url.as_deref().map(|u| u.is_empty()).unwrap_or(true) {
+                return MonitorError::InvalidInput(
+                    "uptime monitors require a non-empty url".into(),
+                )
+                .into_response();
+            }
+            (body.url.as_deref(), None::<&str>, None::<i32>)
+        }
+        "tcp" => {
+            if body.tcp_host.as_deref().map(|h| h.is_empty()).unwrap_or(true) {
+                return MonitorError::InvalidInput(
+                    "tcp monitors require a non-empty tcp_host".into(),
+                )
+                .into_response();
+            }
+            let port = body.tcp_port.unwrap_or(0);
+            if port < 1 || port > 65535 {
+                return MonitorError::InvalidInput(
+                    "tcp monitors require tcp_port between 1 and 65535".into(),
+                )
+                .into_response();
+            }
+            (None::<&str>, body.tcp_host.as_deref(), Some(port))
+        }
+        _ => {
+            return MonitorError::InvalidInput("kind must be 'uptime' or 'tcp'".into())
+                .into_response();
+        }
+    };
+
     match sqlx::query_as::<_, Monitor>(
-        "INSERT INTO monitors (workspace_id, name, url, interval_secs, failure_threshold, recovery_threshold)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, workspace_id, name, url, interval_secs, status,
-                   failure_threshold, recovery_threshold, kind, created_at, updated_at",
+        "INSERT INTO monitors \
+             (workspace_id, name, kind, url, tcp_host, tcp_port, interval_secs, failure_threshold, recovery_threshold) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         RETURNING id, workspace_id, name, url, interval_secs, status, \
+                   failure_threshold, recovery_threshold, kind, tcp_host, tcp_port, created_at, updated_at",
     )
     .bind(workspace_id)
     .bind(&body.name)
-    .bind(&body.url)
+    .bind(kind)
+    .bind(url_val)
+    .bind(tcp_host_val)
+    .bind(tcp_port_val)
     .bind(body.interval_secs)
     .bind(failure_threshold)
     .bind(recovery_threshold)
@@ -126,11 +163,11 @@ async fn list_monitors(
 
     let sql = if params.include_archived.unwrap_or(false) {
         "SELECT id, workspace_id, name, url, interval_secs, status,
-                failure_threshold, recovery_threshold, kind, created_at, updated_at
+                failure_threshold, recovery_threshold, kind, tcp_host, tcp_port, created_at, updated_at
          FROM monitors WHERE workspace_id = $1 ORDER BY created_at ASC"
     } else {
         "SELECT id, workspace_id, name, url, interval_secs, status,
-                failure_threshold, recovery_threshold, kind, created_at, updated_at
+                failure_threshold, recovery_threshold, kind, tcp_host, tcp_port, created_at, updated_at
          FROM monitors WHERE workspace_id = $1 AND status != 'archived' ORDER BY created_at ASC"
     };
 
@@ -158,7 +195,7 @@ async fn get_monitor(
 
     match sqlx::query_as::<_, Monitor>(
         "SELECT id, workspace_id, name, url, interval_secs, status,
-                failure_threshold, recovery_threshold, kind, created_at, updated_at
+                failure_threshold, recovery_threshold, kind, tcp_host, tcp_port, created_at, updated_at
          FROM monitors WHERE id = $1 AND workspace_id = $2",
     )
     .bind(monitor_id)
@@ -249,7 +286,7 @@ async fn patch_monitor(
              updated_at         = NOW()
          WHERE id = $7 AND workspace_id = $8
          RETURNING id, workspace_id, name, url, interval_secs, status,
-                   failure_threshold, recovery_threshold, kind, created_at, updated_at",
+                   failure_threshold, recovery_threshold, kind, tcp_host, tcp_port, created_at, updated_at",
     )
     .bind(body.name)
     .bind(body.url)
@@ -1163,6 +1200,114 @@ mod tests {
         let body = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "invalid_input");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_tcp_monitor_success(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({
+                "name": "DB Port",
+                "kind": "tcp",
+                "tcp_host": "127.0.0.1",
+                "tcp_port": 5432,
+                "interval_secs": 60
+            })),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["kind"], "tcp");
+        assert_eq!(json["tcp_host"], "127.0.0.1");
+        assert_eq!(json["tcp_port"], 5432);
+        assert!(json["url"].is_null(), "url should be null for tcp monitors");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_tcp_monitor_missing_fields(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        // missing tcp_host
+        let res = authed(
+            pool.clone(),
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({"name": "DB Port", "kind": "tcp", "tcp_port": 5432, "interval_secs": 60})),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "invalid_input");
+
+        // missing tcp_port
+        let res2 = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({"name": "DB Port", "kind": "tcp", "tcp_host": "127.0.0.1", "interval_secs": 60})),
+        )
+        .await;
+        assert_eq!(res2.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_tcp_monitor_invalid_port(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        for port in &[0_i64, 65536_i64] {
+            let res = authed(
+                pool.clone(),
+                Method::POST,
+                &format!("/api/workspaces/{wid}/monitors"),
+                uid,
+                Some(json!({
+                    "name": "DB Port",
+                    "kind": "tcp",
+                    "tcp_host": "127.0.0.1",
+                    "tcp_port": port,
+                    "interval_secs": 60
+                })),
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "port {port} should be rejected"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn create_tcp_monitor_rejects_empty_host(pool: PgPool) {
+        let uid = create_test_user(&pool).await;
+        let wid = create_test_workspace(&pool, uid).await;
+        let res = authed(
+            pool,
+            Method::POST,
+            &format!("/api/workspaces/{wid}/monitors"),
+            uid,
+            Some(json!({
+                "name": "DB Port",
+                "kind": "tcp",
+                "tcp_host": "",
+                "tcp_port": 5432,
+                "interval_secs": 60
+            })),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["code"], "invalid_input");
     }

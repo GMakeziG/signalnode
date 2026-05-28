@@ -2051,6 +2051,7 @@ dependencies = [
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "signalnode-shared",
  "sqlx",
  "tokio",
  "tower",
@@ -2070,12 +2071,21 @@ dependencies = [
  "reqwest",
  "serde_json",
  "serial_test",
+ "signalnode-shared",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "signalnode-shared"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "uuid",
 ]
 
 [[package]]

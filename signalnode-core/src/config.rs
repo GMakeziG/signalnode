@@ -6,6 +6,7 @@ pub struct Config {
     pub poll_interval_secs: u64,
     pub checker_poll_interval_secs: u64,
     pub purge_interval_secs: u64,
+    pub tcp_check_timeout_ms: u64,
 }
 
 impl Config {
@@ -38,7 +39,11 @@ impl Config {
             .map(|v| v.parse::<u64>().expect("TOKEN_PURGE_INTERVAL_SECS must be a positive integer"))
             .unwrap_or(3600);
 
-        Config { database_url, smtp, poll_interval_secs, checker_poll_interval_secs, purge_interval_secs }
+        let tcp_check_timeout_ms = get("TCP_CHECK_TIMEOUT_MS")
+            .map(|v| v.parse::<u64>().expect("TCP_CHECK_TIMEOUT_MS must be a positive integer"))
+            .unwrap_or(5000);
+
+        Config { database_url, smtp, poll_interval_secs, checker_poll_interval_secs, purge_interval_secs, tcp_check_timeout_ms }
     }
 }
 
@@ -123,5 +128,20 @@ mod tests {
         assert_eq!(smtp.user, "user@example.com");
         assert_eq!(smtp.pass, "secret");
         assert_eq!(smtp.from, "from@example.com");
+    }
+
+    #[test]
+    fn from_env_uses_tcp_check_timeout_default() {
+        let cfg = Config::from_provider(vars(&[("DATABASE_URL", "postgres://unused")]));
+        assert_eq!(cfg.tcp_check_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn from_env_parses_tcp_check_timeout() {
+        let cfg = Config::from_provider(vars(&[
+            ("DATABASE_URL", "postgres://unused"),
+            ("TCP_CHECK_TIMEOUT_MS", "3000"),
+        ]));
+        assert_eq!(cfg.tcp_check_timeout_ms, 3000);
     }
 }

@@ -2,16 +2,20 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use sqlx::PgPool;
+use tokio::net::TcpStream;
 use uuid::Uuid;
 
 #[derive(sqlx::FromRow)]
 struct DueMonitor {
     id: Uuid,
     workspace_id: Uuid,
-    url: String,
+    url: Option<String>,
     failure_threshold: i32,
     recovery_threshold: i32,
     interval_secs: i32,
+    kind: String,
+    tcp_host: Option<String>,
+    tcp_port: Option<i32>,
 }
 
 struct CheckOutcome {
@@ -21,7 +25,38 @@ struct CheckOutcome {
     error_detail: Option<String>,
 }
 
-pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
+async fn check_tcp(host: &str, port: u16, timeout_dur: Duration, monitor: DueMonitor) -> CheckOutcome {
+    let addr = format!("{host}:{port}");
+    let start = Instant::now();
+    match tokio::time::timeout(timeout_dur, TcpStream::connect(&*addr)).await {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            CheckOutcome {
+                latency_ms: Some(start.elapsed().as_millis() as i32),
+                status: "up",
+                error_detail: None,
+                monitor,
+            }
+        }
+        Ok(Err(e)) => CheckOutcome {
+            latency_ms: None,
+            status: "down",
+            error_detail: Some(e.to_string()),
+            monitor,
+        },
+        Err(_) => CheckOutcome {
+            latency_ms: None,
+            status: "down",
+            error_detail: Some(format!(
+                "connection timed out after {}ms",
+                timeout_dur.as_millis()
+            )),
+            monitor,
+        },
+    }
+}
+
+pub async fn check_once(pool: &PgPool, client: &reqwest::Client, tcp_timeout: Duration) {
     // Phase 1: claim due monitors in a short transaction, stamp last_checked_at immediately
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
@@ -32,15 +67,16 @@ pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
     };
 
     let monitors = match sqlx::query_as::<_, DueMonitor>(
-        "SELECT id, workspace_id, url, failure_threshold, recovery_threshold, interval_secs \
-         FROM monitors \
-         WHERE status = 'active' \
-           AND kind = 'uptime' \
-           AND (last_checked_at IS NULL \
-                OR last_checked_at + interval_secs * INTERVAL '1 second' <= NOW()) \
-         ORDER BY last_checked_at ASC NULLS FIRST \
-         LIMIT 50 \
-         FOR UPDATE SKIP LOCKED",
+        "SELECT id, workspace_id, url, failure_threshold, recovery_threshold, interval_secs, \
+         kind, tcp_host, tcp_port \
+ FROM monitors \
+ WHERE status = 'active' \
+   AND kind IN ('uptime', 'tcp') \
+   AND (last_checked_at IS NULL \
+        OR last_checked_at + interval_secs * INTERVAL '1 second' <= NOW()) \
+ ORDER BY last_checked_at ASC NULLS FIRST \
+ LIMIT 50 \
+ FOR UPDATE SKIP LOCKED",
     )
     .fetch_all(&mut *tx)
     .await
@@ -71,30 +107,51 @@ pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
         return;
     }
 
-    // HTTP checks — no DB locks held; all monitors checked concurrently
+    // Checks — no DB locks held; all monitors checked concurrently
     let outcomes: Vec<CheckOutcome> = join_all(monitors.into_iter().map(|m| {
         let client = client.clone();
         async move {
-            let start = Instant::now();
-            match client.get(&m.url).send().await {
-                Ok(resp) if resp.status().is_success() => CheckOutcome {
-                    latency_ms: Some(start.elapsed().as_millis() as i32),
-                    status: "up",
-                    error_detail: None,
-                    monitor: m,
-                },
-                Ok(resp) => CheckOutcome {
-                    latency_ms: Some(start.elapsed().as_millis() as i32),
-                    status: "down",
-                    error_detail: Some(format!("HTTP {}", resp.status().as_u16())),
-                    monitor: m,
-                },
-                Err(e) => CheckOutcome {
-                    latency_ms: None,
-                    status: "down",
-                    error_detail: Some(e.to_string()),
-                    monitor: m,
-                },
+            match m.kind.as_str() {
+                "uptime" => {
+                    let url = m.url.as_deref().unwrap_or("").to_string();
+                    let start = Instant::now();
+                    match client.get(&url).send().await {
+                        Ok(resp) if resp.status().is_success() => CheckOutcome {
+                            latency_ms: Some(start.elapsed().as_millis() as i32),
+                            status: "up",
+                            error_detail: None,
+                            monitor: m,
+                        },
+                        Ok(resp) => CheckOutcome {
+                            latency_ms: Some(start.elapsed().as_millis() as i32),
+                            status: "down",
+                            error_detail: Some(format!("HTTP {}", resp.status().as_u16())),
+                            monitor: m,
+                        },
+                        Err(e) => CheckOutcome {
+                            latency_ms: None,
+                            status: "down",
+                            error_detail: Some(e.to_string()),
+                            monitor: m,
+                        },
+                    }
+                }
+                "tcp" => {
+                    let host = m.tcp_host.as_deref().unwrap_or("").to_string();
+                    let port = m.tcp_port.unwrap_or(0) as u16;
+                    check_tcp(&host, port, tcp_timeout, m).await
+                }
+                _ => {
+                    let kind = m.kind.clone();
+                    tracing::error!(monitor_id = %m.id, kind = %kind, "check_once: unknown monitor kind");
+                    // isolated arm — add metric counter here during observability phase
+                    CheckOutcome {
+                        status: "down",
+                        latency_ms: None,
+                        error_detail: Some(format!("unknown monitor kind: {kind}")),
+                        monitor: m,
+                    }
+                }
             }
         }
     }))
@@ -145,9 +202,9 @@ pub async fn check_once(pool: &PgPool, client: &reqwest::Client) {
     }
 }
 
-pub async fn run_checker(pool: PgPool, client: reqwest::Client, interval: Duration) {
+pub async fn run_checker(pool: PgPool, client: reqwest::Client, interval: Duration, tcp_timeout: Duration) {
     loop {
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, tcp_timeout).await;
         tokio::time::sleep(interval).await;
     }
 }
@@ -189,6 +246,86 @@ mod tests {
         (wid, mid)
     }
 
+    async fn insert_tcp_monitor(pool: &PgPool, host: &str, port: i32) -> (Uuid, Uuid) {
+        let uid = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO users (email, password_hash) \
+             VALUES ('tcp-checker-test@example.com', 'x') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let wid = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO workspaces (name, slug, owner_id) \
+             VALUES ('W', 'tcp-checker-test', $1) RETURNING id",
+        )
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let mid = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO monitors (workspace_id, name, kind, tcp_host, tcp_port, interval_secs) \
+             VALUES ($1, 'TCP Monitor', 'tcp', $2, $3, 60) RETURNING id",
+        )
+        .bind(wid)
+        .bind(host)
+        .bind(port)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        (wid, mid)
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_tcp_up_when_port_open(pool: PgPool) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port() as i32;
+
+        let (_wid, mid) = insert_tcp_monitor(&pool, "127.0.0.1", port).await;
+
+        let client = reqwest::Client::new();
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
+
+        let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, "up");
+        assert!(row.1.is_some(), "latency_ms should be recorded for successful TCP connect");
+        assert!(row.2.is_none(), "error_detail should be None for up");
+
+        drop(listener);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn check_once_tcp_down_when_port_refused(pool: PgPool) {
+        let (_wid, mid) = insert_tcp_monitor(&pool, "127.0.0.1", 1).await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        check_once(&pool, &client, Duration::from_millis(200)).await;
+
+        let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, "down");
+        assert!(row.1.is_none(), "latency_ms should be None when connection refused");
+        assert!(row.2.is_some(), "error_detail should contain the error message");
+    }
+
     #[sqlx::test(migrations = "../migrations")]
     async fn check_once_skips_paused_monitor(pool: PgPool) {
         let (_wid, mid) = insert_monitor(&pool, "http://127.0.0.1:1").await;
@@ -199,7 +336,7 @@ mod tests {
             .unwrap();
 
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let last_checked_at: Option<DateTime<Utc>> = sqlx::query_scalar(
             "SELECT last_checked_at FROM monitors WHERE id = $1",
@@ -232,7 +369,7 @@ mod tests {
         .unwrap();
 
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let after: Option<DateTime<Utc>> = sqlx::query_scalar(
             "SELECT last_checked_at FROM monitors WHERE id = $1",
@@ -254,7 +391,7 @@ mod tests {
 
         let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let last_checked_at: Option<DateTime<Utc>> = sqlx::query_scalar(
             "SELECT last_checked_at FROM monitors WHERE id = $1",
@@ -277,7 +414,7 @@ mod tests {
 
         let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
             "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
@@ -303,7 +440,7 @@ mod tests {
 
         let (_wid, mid) = insert_monitor(&pool, &mock.uri()).await;
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
             "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
@@ -325,7 +462,7 @@ mod tests {
             .timeout(std::time::Duration::from_millis(200))
             .build()
             .unwrap();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let row: (String, Option<i32>, Option<String>) = sqlx::query_as(
             "SELECT status, latency_ms, error_detail FROM check_results WHERE monitor_id = $1",
@@ -349,7 +486,10 @@ mod tests {
 
         let (_wid, _mid) = insert_monitor(&pool, &mock.uri()).await;
         let client = reqwest::Client::new();
-        tokio::join!(check_once(&pool, &client), check_once(&pool, &client));
+        tokio::join!(
+            check_once(&pool, &client, Duration::from_millis(5000)),
+            check_once(&pool, &client, Duration::from_millis(5000))
+        );
 
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_results")
             .fetch_one(&pool)
@@ -383,7 +523,7 @@ mod tests {
         .unwrap();
 
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let incident_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL",
@@ -429,7 +569,7 @@ mod tests {
             .unwrap();
 
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let open_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL",
@@ -472,7 +612,7 @@ mod tests {
             .unwrap();
 
         let client = reqwest::Client::new();
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM incidents WHERE monitor_id = $1 AND closed_at IS NULL",
@@ -496,7 +636,7 @@ mod tests {
         let client = reqwest::Client::new();
 
         // Tick 1
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         // Simulate the monitor's interval having elapsed by backdating last_checked_at
         sqlx::query(
@@ -510,7 +650,7 @@ mod tests {
         .unwrap();
 
         // Tick 2
-        check_once(&pool, &client).await;
+        check_once(&pool, &client, Duration::from_millis(5000)).await;
 
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM check_results WHERE monitor_id = $1",

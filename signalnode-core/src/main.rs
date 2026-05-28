@@ -31,6 +31,7 @@ async fn main() {
     let worker_interval = Duration::from_secs(cfg.poll_interval_secs);
     let checker_interval = Duration::from_secs(cfg.checker_poll_interval_secs);
     let purge_interval = Duration::from_secs(cfg.purge_interval_secs);
+    let tcp_timeout = Duration::from_millis(cfg.tcp_check_timeout_ms);
 
     info!(
         worker_interval_secs = cfg.poll_interval_secs,
@@ -46,7 +47,7 @@ async fn main() {
         cfg.smtp,
         worker_interval,
     ));
-    let h2 = tokio::spawn(checker::run_checker(pool.clone(), client, checker_interval));
+    let h2 = tokio::spawn(checker::run_checker(pool.clone(), client, checker_interval, tcp_timeout));
     let h3 = tokio::spawn(purger::run_purger(pool, purge_interval));
     let (r1, r2, r3) = tokio::join!(h1, h2, h3);
     r1.expect("delivery worker panicked");
